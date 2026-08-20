@@ -116,13 +116,18 @@ def install_schema(conn: sqlite3.Connection) -> None:
     CREATE TRIGGER IF NOT EXISTS production_required_before_dispatch
     BEFORE UPDATE OF status ON tasks WHEN NEW.production_incident_required = 1
       AND NEW.status IN ('ready','running')
-      AND NOT EXISTS (SELECT 1 FROM production_incidents i WHERE i.task_id=NEW.id)
-    BEGIN SELECT RAISE(ABORT, 'P0 task requires production incident binding'); END;
+      AND NOT EXISTS (SELECT 1 FROM production_incidents i WHERE i.task_id=NEW.id
+          AND i.state = 'approved_executing')
+    BEGIN SELECT RAISE(ABORT, 'P0 task requires approved production execution'); END;
     CREATE TRIGGER IF NOT EXISTS production_required_before_done
     BEFORE UPDATE OF status ON tasks WHEN NEW.production_incident_required = 1 AND NEW.status='done'
       AND NOT EXISTS (SELECT 1 FROM production_incidents i WHERE i.task_id=NEW.id
-          AND i.state IN ('production_completed','human_blocked'))
+          AND i.state = 'production_completed')
     BEGIN SELECT RAISE(ABORT, 'P0 task lacks verified production completion'); END;
+    CREATE TRIGGER IF NOT EXISTS production_required_is_irrevocable
+    BEFORE UPDATE OF production_incident_required ON tasks
+    WHEN OLD.production_incident_required = 1 AND NEW.production_incident_required = 0
+    BEGIN SELECT RAISE(ABORT, 'P0 guard cannot be removed'); END;
     CREATE TRIGGER IF NOT EXISTS production_incident_not_orphaned
     BEFORE DELETE ON tasks WHEN OLD.production_incident_required = 1
       AND EXISTS (SELECT 1 FROM production_incidents i WHERE i.task_id=OLD.id AND i.state NOT IN ('production_completed','human_blocked'))
@@ -150,8 +155,6 @@ def admit_p0_task(conn: sqlite3.Connection, *, title: str, assignee: str, owner:
         conn.execute("INSERT INTO tasks (id,title,assignee,status,created_at,production_incident_required) VALUES (?,?,?,'triage',?,1)", (task_id, title.strip(), assignee, now))
         conn.execute("INSERT INTO production_incidents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (incident_id, task_id, owner, operator_target, adapter_id, int(retry_safe), "registered", 1, 1, now + EVIDENCE_WINDOW_SECONDS, digest, now, now))
         conn.execute("INSERT INTO production_gate_specs VALUES (?,?,?,?,?,?,?,?,?,?)", (incident_id, 1, digest, gate_spec.action, gate_spec.risk, gate_spec.rollback, gate_spec.verification_procedure, gate_spec.target, gate_spec.environment, now))
-        # The invariant trigger allows dispatch only after this binding exists.
-        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
         _event(conn, incident_id, "registered", now, task_id=task_id, digest=digest)
         _outbox(conn, incident_id, operator_target, "admitted", now)
         conn.execute("COMMIT")
@@ -200,6 +203,26 @@ def grant_approval(conn: sqlite3.Connection, incident_id: str, *, principal: str
     return incident
 
 
+def begin_approved_execution(conn: sqlite3.Connection, incident_id: str, *, expected_version: int, now: int) -> Incident:
+    """Consume a live approval and make the bound task dispatchable once."""
+    with conn:
+        incident = get_incident(conn, incident_id)
+        if incident.version != expected_version or incident.state != "approved_dispatching":
+            raise StateConflict("incident is not awaiting approved execution")
+        approval = conn.execute(
+            "SELECT id FROM production_approvals WHERE incident_id=? AND spec_digest=? "
+            "AND invalidated_at IS NULL AND used_at IS NULL AND expires_at>? ORDER BY id DESC LIMIT 1",
+            (incident_id, incident.spec_digest, now),
+        ).fetchone()
+        if not approval:
+            raise StateConflict("no live approval for execution")
+        conn.execute("UPDATE production_approvals SET used_at=? WHERE id=?", (now, approval[0]))
+        incident = _cas(conn, incident_id, expected_version, state="approved_executing", now=now)
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (incident.task_id,))
+        _event(conn, incident_id, "execution_started", now, fence=incident.fence_token)
+    return incident
+
+
 def update_gate_spec(conn: sqlite3.Connection, incident_id: str, gate_spec: GateSpec, *, expected_version: int, now: int) -> Incident:
     digest = spec_digest(gate_spec)
     with conn:
@@ -220,6 +243,8 @@ def accept_verified_receipt(conn: sqlite3.Connection, *, incident_id: str, adapt
         incident = get_incident(conn, incident_id)
         if incident.adapter_id != adapter_id or incident.fence_token != fence_token or incident.spec_digest != spec_digest:
             raise StateConflict("stale or foreign receipt")
+        if incident.state != "approved_executing":
+            raise StateConflict("receipt requires approved execution")
         conn.execute("INSERT INTO production_evidence (incident_id,adapter_id,execution_id,fence_token,spec_digest,attestation,accepted_at) VALUES (?,?,?,?,?,?,?)", (incident_id, adapter_id, execution_id, fence_token, spec_digest, attestation, now))
         incident = _cas(conn, incident_id, incident.version, state=COMPLETED, now=now, evidence_deadline=now + EVIDENCE_WINDOW_SECONDS)
         _event(conn, incident_id, "evidence_accepted", now, execution_id=execution_id)

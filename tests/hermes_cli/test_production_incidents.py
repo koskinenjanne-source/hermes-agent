@@ -34,8 +34,10 @@ def test_p0_admission_is_bound_and_completion_requires_verified_evidence(board):
         operator_target="telegram:operator", gate_spec=spec(), now=100,
     )
     assert board.execute("SELECT production_incident_required FROM tasks WHERE id=?", (task_id,)).fetchone()[0] == 1
-    with pytest.raises(sqlite3.IntegrityError, match="verified production completion"):
-        kb.complete_task(board, task_id, summary="worker prose is not evidence")
+    assert not kb.complete_task(board, task_id, summary="worker prose is not evidence")
+    incident = pi.require_approval(board, incident_id, expected_version=pi.get_incident(board, incident_id).version, now=101)
+    incident = pi.grant_approval(board, incident_id, principal="ops", expected_version=incident.version, expires_at=200, now=101)
+    pi.begin_approved_execution(board, incident_id, expected_version=incident.version, now=101)
     pi.accept_verified_receipt(
         board, incident_id=incident_id, adapter_id="manual", execution_id="run-1",
         fence_token=1, spec_digest=pi.spec_digest(spec()), attestation="verified:run-1", now=101,
@@ -83,3 +85,38 @@ def test_legacy_registration_is_idempotent(board):
     second = pi.register_legacy_incidents(board, now=1)
     assert first == second
     assert len(first) == 3
+
+
+def test_unapproved_p0_task_never_enters_normal_dispatch(board):
+    task_id, _ = pi.admit_p0_task(
+        board, title="P0", assignee="executor", owner="operator",
+        operator_target="telegram:operator", gate_spec=spec(), now=0,
+    )
+    assert board.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()[0] == "triage"
+    with pytest.raises(sqlite3.IntegrityError, match="approved production execution"):
+        board.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+
+
+def test_direct_mutation_cannot_clear_p0_guard_or_complete_human_block(board):
+    task_id, incident_id = pi.admit_p0_task(
+        board, title="P0", assignee="executor", owner="operator",
+        operator_target="telegram:operator", gate_spec=spec(), now=0,
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="P0 guard cannot be removed"):
+        board.execute("UPDATE tasks SET production_incident_required=0 WHERE id=?", (task_id,))
+    pi.controller_tick(board, now=pi.EVIDENCE_WINDOW_SECONDS)
+    assert pi.get_incident(board, incident_id).state == pi.HUMAN_BLOCKED
+    with pytest.raises(sqlite3.IntegrityError, match="verified production completion"):
+        board.execute("UPDATE tasks SET status='done' WHERE id=?", (task_id,))
+
+
+def test_receipt_requires_live_approved_execution(board):
+    _, incident_id = pi.admit_p0_task(
+        board, title="P0", assignee="executor", owner="operator",
+        operator_target="telegram:operator", gate_spec=spec(), now=0,
+    )
+    with pytest.raises(pi.StateConflict, match="approved execution"):
+        pi.accept_verified_receipt(
+            board, incident_id=incident_id, adapter_id="manual", execution_id="forged",
+            fence_token=1, spec_digest=pi.spec_digest(spec()), attestation="verified:forged", now=1,
+        )
