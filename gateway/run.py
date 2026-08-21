@@ -11736,6 +11736,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # when another gateway owns the single dispatcher.
         self._spawn_supervised(self._kanban_notifier_watcher, "kanban_notifier_watcher")
 
+        # P0 incident control is deliberately independent of the ordinary
+        # Kanban dispatcher/notifier best-effort paths.
+        self._spawn_supervised(self._production_incident_watcher, "production_incident_watcher")
+
         # Start background kanban dispatcher — spawns workers for ready
         # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
         # When false, users run `hermes kanban daemon` externally or

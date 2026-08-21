@@ -138,6 +138,79 @@ class GatewayKanbanWatchersMixin:
         self._kanban_dispatcher_lock_handle = None
         _release_singleton_lock(handle)
 
+    async def _production_incident_tick(self) -> None:
+        """Run the P0 controller and its independent operator-only outbox.
+
+        This deliberately does not share the normal Kanban subscriber notifier:
+        P0 delivery has a leased DB outbox, a configured target allowlist, and
+        ack/retry/dead-letter semantics.
+        """
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli import production_incidents as _pi
+        from hermes_cli.config import load_config as _load_config
+        from gateway.config import Platform as _Platform
+        try:
+            cfg = _load_config().get("production_incidents", {})
+            targets = set(cfg.get("operator_targets", []))
+            principals = set(cfg.get("approval_principals", []))
+            registry = getattr(self, "_production_adapter_registry", _pi.AdapterRegistry())
+            if not targets or not principals:
+                logger.error("production incident controller: missing configured trust roots; refusing P0 delivery")
+                return
+            now = int(time.time())
+            estop = not _kanban_dispatch_allowed()
+            boards = _kb.list_boards(include_archived=False)
+            for meta in boards:
+                slug = meta.get("slug") or _kb.DEFAULT_BOARD
+                def _control():
+                    conn = _kb.connect(board=slug)
+                    try:
+                        _pi.controller_tick(conn, now=now, registry=registry, estop_engaged=estop)
+                        return _pi.claim_notification(conn, now=now)
+                    finally:
+                        conn.close()
+                note = await asyncio.to_thread(_control)
+                if not note:
+                    continue
+                if note.target not in targets or not _pi.operator_target_is_safe(note.target):
+                    def _dead_letter():
+                        conn = _kb.connect(board=slug)
+                        try: _pi.fail_notification(conn, note.id, now=now, error="unconfigured operator target", max_attempts=1)
+                        finally: conn.close()
+                    await asyncio.to_thread(_dead_letter)
+                    continue
+                try:
+                    platform_name, chat_id = note.target.split(":", 1)
+                    adapter = self.adapters.get(_Platform(platform_name.lower()))
+                    if adapter is None:
+                        raise RuntimeError("configured operator adapter unavailable")
+                    sent = await adapter.send(chat_id, note.body, metadata={"production_incident": note.incident_id})
+                    if getattr(sent, "success", True) is False:
+                        raise RuntimeError("configured operator adapter rejected delivery")
+                except Exception as exc:
+                    def _fail():
+                        conn = _kb.connect(board=slug)
+                        try: _pi.fail_notification(conn, note.id, now=now, error=str(exc), max_attempts=5)
+                        finally: conn.close()
+                    await asyncio.to_thread(_fail)
+                else:
+                    def _ack():
+                        conn = _kb.connect(board=slug)
+                        try: _pi.acknowledge_notification(conn, note.id, now=now)
+                        finally: conn.close()
+                    await asyncio.to_thread(_ack)
+        except Exception:
+            logger.exception("production incident controller tick failed")
+
+    async def _production_incident_watcher(self, interval: float = 5.0) -> None:
+        """Dedicated P0 watchdog; it remains live when normal Kanban dispatch is off."""
+        while self._running:
+            await self._production_incident_tick()
+            for _ in range(max(1, int(interval))):
+                if not self._running:
+                    return
+                await asyncio.sleep(1)
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 

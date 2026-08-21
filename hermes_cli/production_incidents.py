@@ -11,7 +11,7 @@ import json
 import secrets
 import sqlite3
 from dataclasses import dataclass, replace
-from typing import Optional
+from typing import Optional, Protocol
 
 EVIDENCE_WINDOW_SECONDS = 30 * 60
 HUMAN_BLOCKED = "human_blocked"
@@ -56,9 +56,47 @@ class Notification:
 
 
 @dataclass(frozen=True)
+class Receipt:
+    incident_id: str
+    adapter_id: str
+    execution_id: str
+    fence_token: int
+    spec_digest: str
+    attestation: str
+
+
+class ProductionAdapter(Protocol):
+    """Configured adapter boundary; a receipt is trusted only after verify()."""
+    adapter_id: str
+    retry_safe: bool
+
+    def execute(self, spec: GateSpec, idempotency_key: str, fence_token: int) -> str: ...
+    def verify(self, receipt: Receipt) -> bool: ...
+
+
+class AdapterRegistry:
+    """Explicit allowlist.  Task metadata can never select an unregistered adapter."""
+    def __init__(self, adapters: Optional[dict[str, ProductionAdapter]] = None):
+        self._adapters = dict(adapters or {})
+
+    def get(self, adapter_id: str) -> Optional[ProductionAdapter]:
+        return self._adapters.get(adapter_id)
+
+
+@dataclass(frozen=True)
 class TickResult:
     reclaimed: list[str]
     blocked: list[str]
+    dispatched: list[str]
+
+
+def receipt_payload(receipt: Receipt) -> str:
+    """Stable attestation payload; excludes the signature itself."""
+    return json.dumps({
+        "adapter_id": receipt.adapter_id, "execution_id": receipt.execution_id,
+        "fence_token": receipt.fence_token, "incident_id": receipt.incident_id,
+        "spec_digest": receipt.spec_digest,
+    }, sort_keys=True, separators=(",", ":"))
 
 
 def spec_digest(spec: GateSpec) -> str:
@@ -71,6 +109,11 @@ def spec_digest(spec: GateSpec) -> str:
 def _target_is_safe(target: str) -> bool:
     value = target.strip().lower()
     return bool(value) and "masa" not in value and "coach" not in value and "coaching" not in value
+
+
+def operator_target_is_safe(target: str) -> bool:
+    """Public structural safety check for gateway delivery-time validation."""
+    return _target_is_safe(target)
 
 
 def install_schema(conn: sqlite3.Connection) -> None:
@@ -102,6 +145,11 @@ def install_schema(conn: sqlite3.Connection) -> None:
       execution_id TEXT NOT NULL, fence_token INTEGER NOT NULL, spec_digest TEXT NOT NULL,
       attestation TEXT NOT NULL, accepted_at INTEGER NOT NULL,
       UNIQUE(incident_id, execution_id, fence_token)
+    );
+    CREATE TABLE IF NOT EXISTS production_executions (
+      incident_id TEXT NOT NULL, execution_id TEXT NOT NULL, fence_token INTEGER NOT NULL,
+      spec_digest TEXT NOT NULL, adapter_id TEXT NOT NULL, dispatched_at INTEGER NOT NULL,
+      PRIMARY KEY(incident_id, execution_id, fence_token)
     );
     CREATE TABLE IF NOT EXISTS production_incident_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT, incident_id TEXT NOT NULL, kind TEXT NOT NULL,
@@ -191,9 +239,10 @@ def require_approval(conn: sqlite3.Connection, incident_id: str, *, expected_ver
     return incident
 
 
-def grant_approval(conn: sqlite3.Connection, incident_id: str, *, principal: str, expected_version: int, expires_at: int, now: int) -> Incident:
-    if not principal.strip() or principal.strip() in {"worker", "executor"} or expires_at <= now:
-        raise ValueError("approval requires non-worker principal and future expiry")
+def grant_approval(conn: sqlite3.Connection, incident_id: str, *, principal: str, expected_version: int, expires_at: int, now: int, allowed_principals: Optional[set[str]] = None) -> Incident:
+    """Grant only from a gateway-provisioned principal allowlist, never task data."""
+    if not allowed_principals or principal.strip() not in allowed_principals or expires_at <= now:
+        raise ValueError("approval requires an allowlisted principal and future expiry")
     with conn:
         incident = get_incident(conn, incident_id)
         if incident.version != expected_version or incident.state != "approval_required": raise StateConflict("approval is no longer required")
@@ -236,23 +285,61 @@ def update_gate_spec(conn: sqlite3.Connection, incident_id: str, gate_spec: Gate
     return incident
 
 
-def accept_verified_receipt(conn: sqlite3.Connection, *, incident_id: str, adapter_id: str, execution_id: str, fence_token: int, spec_digest: str, attestation: str, now: int) -> Incident:
-    if not attestation.startswith("verified:"):
-        raise ValueError("receipt lacks verifier attestation")
+def accept_adapter_receipt(conn: sqlite3.Connection, receipt: Receipt, *, registry: AdapterRegistry, now: int) -> Incident:
+    """Persist only a verifier-authenticated receipt bound to the active fence."""
+    adapter = registry.get(receipt.adapter_id)
+    if adapter is None:
+        raise ValueError("receipt adapter is not allowlisted")
+    try:
+        verified = adapter.verify(receipt)
+    except Exception as exc:
+        raise ValueError("receipt verifier unavailable") from exc
+    if not verified:
+        raise ValueError("receipt attestation rejected")
     with conn:
-        incident = get_incident(conn, incident_id)
-        if incident.adapter_id != adapter_id or incident.fence_token != fence_token or incident.spec_digest != spec_digest:
+        incident = get_incident(conn, receipt.incident_id)
+        if incident.adapter_id != receipt.adapter_id or incident.fence_token != receipt.fence_token or incident.spec_digest != receipt.spec_digest:
             raise StateConflict("stale or foreign receipt")
-        if incident.state != "approved_executing":
+        if incident.state not in {"approved_executing", "verifying"}:
             raise StateConflict("receipt requires approved execution")
-        conn.execute("INSERT INTO production_evidence (incident_id,adapter_id,execution_id,fence_token,spec_digest,attestation,accepted_at) VALUES (?,?,?,?,?,?,?)", (incident_id, adapter_id, execution_id, fence_token, spec_digest, attestation, now))
-        incident = _cas(conn, incident_id, incident.version, state=COMPLETED, now=now, evidence_deadline=now + EVIDENCE_WINDOW_SECONDS)
-        _event(conn, incident_id, "evidence_accepted", now, execution_id=execution_id)
+        execution = conn.execute("SELECT 1 FROM production_executions WHERE incident_id=? AND execution_id=? AND fence_token=? AND spec_digest=? AND adapter_id=?", (receipt.incident_id, receipt.execution_id, receipt.fence_token, receipt.spec_digest, receipt.adapter_id)).fetchone()
+        if not execution:
+            raise StateConflict("receipt is not bound to an approved adapter execution")
+        conn.execute("INSERT INTO production_evidence (incident_id,adapter_id,execution_id,fence_token,spec_digest,attestation,accepted_at) VALUES (?,?,?,?,?,?,?)", (receipt.incident_id, receipt.adapter_id, receipt.execution_id, receipt.fence_token, receipt.spec_digest, receipt.attestation, now))
+        incident = _cas(conn, receipt.incident_id, incident.version, state=COMPLETED, now=now, evidence_deadline=now + EVIDENCE_WINDOW_SECONDS)
+        _event(conn, receipt.incident_id, "evidence_accepted", now, execution_id=receipt.execution_id, receipt_digest=hashlib.sha256(receipt.attestation.encode()).hexdigest())
     return incident
 
 
-def controller_tick(conn: sqlite3.Connection, *, now: int) -> TickResult:
-    reclaimed: list[str] = []; blocked: list[str] = []
+def accept_verified_receipt(conn: sqlite3.Connection, **_: object) -> Incident:
+    """Removed unsafe compatibility route: raw worker strings are never evidence."""
+    raise ValueError("raw attestations are not accepted; use a registered adapter verifier")
+
+
+def _gate_spec(conn: sqlite3.Connection, incident: Incident) -> GateSpec:
+    row = conn.execute("SELECT action,risk,rollback,verification_procedure,target,environment FROM production_gate_specs WHERE incident_id=? AND version=? AND digest=?", (incident.id, incident.version, incident.spec_digest)).fetchone()
+    if not row:
+        # The incident version increments for state transitions; retrieve the immutable
+        # spec by digest instead, then reject ambiguity rather than guessing.
+        row = conn.execute("SELECT action,risk,rollback,verification_procedure,target,environment FROM production_gate_specs WHERE incident_id=? AND digest=?", (incident.id, incident.spec_digest)).fetchone()
+    if not row:
+        raise StateConflict("active gate spec is missing")
+    return GateSpec(*row)
+
+
+def controller_tick(conn: sqlite3.Connection, *, now: int, registry: Optional[AdapterRegistry] = None, estop_engaged: bool = False) -> TickResult:
+    reclaimed: list[str] = []; blocked: list[str] = []; dispatched: list[str] = []
+    # e-stop is fail-closed for every non-terminal P0 incident: create an
+    # operator-visible human block rather than silently leaving an obligation runnable.
+    if estop_engaged:
+        rows = conn.execute("SELECT id,version,operator_target FROM production_incidents WHERE state NOT IN (?,?)", (COMPLETED, HUMAN_BLOCKED)).fetchall()
+        for incident_id, version, target in rows:
+            with conn:
+                _cas(conn, incident_id, version, state=HUMAN_BLOCKED, now=now)
+                _event(conn, incident_id, HUMAN_BLOCKED, now, reason="global emergency stop engaged")
+                _outbox(conn, incident_id, target, HUMAN_BLOCKED, now)
+                blocked.append(incident_id)
+        return TickResult(reclaimed, blocked, dispatched)
     rows = conn.execute("SELECT id,version,state,retry_safe,operator_target FROM production_incidents WHERE state NOT IN (?,?) AND evidence_deadline <= ?", (COMPLETED, HUMAN_BLOCKED, now)).fetchall()
     for incident_id, version, state, retry_safe, target in rows:
         with conn:
@@ -263,16 +350,60 @@ def controller_tick(conn: sqlite3.Connection, *, now: int) -> TickResult:
                 _cas(conn, incident_id, version, state=HUMAN_BLOCKED, now=now)
                 _event(conn, incident_id, HUMAN_BLOCKED, now, reason="evidence deadline elapsed")
                 _outbox(conn, incident_id, target, HUMAN_BLOCKED, now); blocked.append(incident_id)
-    return TickResult(reclaimed, blocked)
+    if registry:
+        rows = conn.execute("SELECT id,version FROM production_incidents WHERE state='approved_executing'").fetchall()
+        for incident_id, version in rows:
+            with conn:
+                incident = get_incident(conn, incident_id)
+                adapter = registry.get(incident.adapter_id)
+                if adapter is None:
+                    _cas(conn, incident_id, version, state=HUMAN_BLOCKED, now=now)
+                    _event(conn, incident_id, HUMAN_BLOCKED, now, reason="configured adapter unavailable")
+                    _outbox(conn, incident_id, conn.execute("SELECT operator_target FROM production_incidents WHERE id=?", (incident_id,)).fetchone()[0], HUMAN_BLOCKED, now)
+                    blocked.append(incident_id)
+                    continue
+                try:
+                    execution_id = adapter.execute(_gate_spec(conn, incident), f"{incident.id}:{incident.spec_digest}", incident.fence_token)
+                    if not execution_id:
+                        raise ValueError("adapter returned no execution identity")
+                    conn.execute("INSERT INTO production_executions VALUES (?,?,?,?,?,?)", (incident.id, str(execution_id), incident.fence_token, incident.spec_digest, incident.adapter_id, now))
+                    _cas(conn, incident_id, version, state="verifying", now=now)
+                    _event(conn, incident_id, "adapter_dispatched", now, execution_id=str(execution_id), fence=incident.fence_token)
+                    dispatched.append(incident_id)
+                except Exception as exc:
+                    _cas(conn, incident_id, version, state=HUMAN_BLOCKED, now=now)
+                    _event(conn, incident_id, HUMAN_BLOCKED, now, reason="adapter dispatch failed", error=str(exc)[:200])
+                    _outbox(conn, incident_id, conn.execute("SELECT operator_target FROM production_incidents WHERE id=?", (incident_id,)).fetchone()[0], HUMAN_BLOCKED, now)
+                    blocked.append(incident_id)
+    return TickResult(reclaimed, blocked, dispatched)
 
 
-def claim_notification(conn: sqlite3.Connection, *, now: int) -> Optional[Notification]:
+def claim_notification(conn: sqlite3.Connection, *, now: int, lease_seconds: int = 60) -> Optional[Notification]:
+    # Expired leases are reclaimable; no subscriber cursor is involved.
+    conn.execute("UPDATE production_notifications SET status='pending', lease_until=NULL WHERE status='leased' AND lease_until<=?", (now,))
     row = conn.execute("SELECT id,incident_id,target,body FROM production_notifications WHERE status='pending' AND next_attempt_at <= ? ORDER BY id LIMIT 1", (now,)).fetchone()
     if not row: return None
     with conn:
-        cur = conn.execute("UPDATE production_notifications SET status='leased',lease_until=?,attempts=attempts+1 WHERE id=? AND status='pending'", (now + 60, row[0]))
+        cur = conn.execute("UPDATE production_notifications SET status='leased',lease_until=?,attempts=attempts+1 WHERE id=? AND status='pending'", (now + lease_seconds, row[0]))
         if cur.rowcount != 1: return None
     return Notification(*row)
+
+
+def acknowledge_notification(conn: sqlite3.Connection, notification_id: int, *, now: int) -> bool:
+    with conn:
+        return conn.execute("UPDATE production_notifications SET status='acknowledged', acknowledged_at=?, lease_until=NULL WHERE id=? AND status='leased'", (now, notification_id)).rowcount == 1
+
+
+def fail_notification(conn: sqlite3.Connection, notification_id: int, *, now: int, error: str, max_attempts: int = 5) -> bool:
+    with conn:
+        row = conn.execute("SELECT attempts FROM production_notifications WHERE id=? AND status='leased'", (notification_id,)).fetchone()
+        if not row:
+            return False
+        attempts = int(row[0])
+        if attempts >= max_attempts:
+            return conn.execute("UPDATE production_notifications SET status='dead_letter', dead_letter_at=?, lease_until=NULL WHERE id=? AND status='leased'", (now, notification_id)).rowcount == 1
+        backoff = min(300, 2 ** attempts)
+        return conn.execute("UPDATE production_notifications SET status='pending', lease_until=NULL, next_attempt_at=?, body=body WHERE id=? AND status='leased'", (now + backoff, notification_id)).rowcount == 1
 
 
 def register_legacy_incidents(conn: sqlite3.Connection, *, now: int) -> list[str]:
