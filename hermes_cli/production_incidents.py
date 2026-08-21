@@ -159,8 +159,20 @@ def install_schema(conn: sqlite3.Connection) -> None:
       id INTEGER PRIMARY KEY AUTOINCREMENT, incident_id TEXT NOT NULL, target TEXT NOT NULL,
       dedupe_key TEXT NOT NULL UNIQUE, body TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
       lease_until INTEGER, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL,
-      acknowledged_at INTEGER, dead_letter_at INTEGER, created_at INTEGER NOT NULL
+      acknowledged_at INTEGER, dead_letter_at INTEGER, last_error TEXT, last_error_at INTEGER,
+      created_at INTEGER NOT NULL
     );
+    CREATE TRIGGER IF NOT EXISTS production_required_insert_before_dispatch
+    BEFORE INSERT ON tasks WHEN NEW.production_incident_required = 1
+      AND NEW.status IN ('ready','running')
+      AND NOT EXISTS (SELECT 1 FROM production_incidents i WHERE i.task_id=NEW.id
+          AND i.state = 'approved_executing')
+    BEGIN SELECT RAISE(ABORT, 'P0 task requires approved production execution'); END;
+    CREATE TRIGGER IF NOT EXISTS production_required_insert_before_done
+    BEFORE INSERT ON tasks WHEN NEW.production_incident_required = 1 AND NEW.status='done'
+      AND NOT EXISTS (SELECT 1 FROM production_incidents i WHERE i.task_id=NEW.id
+          AND i.state = 'production_completed')
+    BEGIN SELECT RAISE(ABORT, 'P0 task lacks verified production completion'); END;
     CREATE TRIGGER IF NOT EXISTS production_required_before_dispatch
     BEFORE UPDATE OF status ON tasks WHEN NEW.production_incident_required = 1
       AND NEW.status IN ('ready','running')
@@ -181,6 +193,11 @@ def install_schema(conn: sqlite3.Connection) -> None:
       AND EXISTS (SELECT 1 FROM production_incidents i WHERE i.task_id=OLD.id AND i.state NOT IN ('production_completed','human_blocked'))
     BEGIN SELECT RAISE(ABORT, 'active production incident cannot be orphaned'); END;
     """)
+    notification_cols = {row[1] for row in conn.execute("PRAGMA table_info(production_notifications)")}
+    if "last_error" not in notification_cols:
+        conn.execute("ALTER TABLE production_notifications ADD COLUMN last_error TEXT")
+    if "last_error_at" not in notification_cols:
+        conn.execute("ALTER TABLE production_notifications ADD COLUMN last_error_at INTEGER")
 
 
 def _event(conn: sqlite3.Connection, incident_id: str, kind: str, now: int, **payload: object) -> None:
@@ -327,6 +344,36 @@ def _gate_spec(conn: sqlite3.Connection, incident: Incident) -> GateSpec:
     return GateSpec(*row)
 
 
+def _quarantine_normal_task(conn: sqlite3.Connection, task_id: str, *, now: int) -> None:
+    """Fence an expired P0 execution out of the ordinary Kanban worker path."""
+    row = conn.execute(
+        "SELECT status,current_run_id FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    if not row or row["status"] not in {"ready", "running"}:
+        return
+    run_id = row["current_run_id"]
+    if run_id is not None:
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET status='reclaimed', outcome='reclaimed', ended_at=?,
+                   claim_lock=NULL, claim_expires=NULL, worker_pid=NULL,
+                   summary=COALESCE(summary, 'production execution fence superseded')
+             WHERE id=? AND ended_at IS NULL
+            """,
+            (now, run_id),
+        )
+    conn.execute(
+        """
+        UPDATE tasks
+           SET status='triage', claim_lock=NULL, claim_expires=NULL,
+               worker_pid=NULL, last_heartbeat_at=NULL, current_run_id=NULL
+         WHERE id=? AND status IN ('ready','running')
+        """,
+        (task_id,),
+    )
+
+
 def controller_tick(conn: sqlite3.Connection, *, now: int, registry: Optional[AdapterRegistry] = None, estop_engaged: bool = False) -> TickResult:
     reclaimed: list[str] = []; blocked: list[str] = []; dispatched: list[str] = []
     # e-stop is fail-closed for every non-terminal P0 incident: create an
@@ -344,7 +391,9 @@ def controller_tick(conn: sqlite3.Connection, *, now: int, registry: Optional[Ad
     for incident_id, version, state, retry_safe, target in rows:
         with conn:
             if retry_safe:
-                updated = _cas(conn, incident_id, version, state="reclaiming", now=now, fence_token=get_incident(conn, incident_id).fence_token + 1)
+                incident = get_incident(conn, incident_id)
+                _quarantine_normal_task(conn, incident.task_id, now=now)
+                updated = _cas(conn, incident_id, version, state="reclaiming", now=now, fence_token=incident.fence_token + 1)
                 _event(conn, incident_id, "reclaimed", now, fence=updated.fence_token); reclaimed.append(incident_id)
             else:
                 _cas(conn, incident_id, version, state=HUMAN_BLOCKED, now=now)
@@ -400,10 +449,11 @@ def fail_notification(conn: sqlite3.Connection, notification_id: int, *, now: in
         if not row:
             return False
         attempts = int(row[0])
+        error = str(error)[:1000]
         if attempts >= max_attempts:
-            return conn.execute("UPDATE production_notifications SET status='dead_letter', dead_letter_at=?, lease_until=NULL WHERE id=? AND status='leased'", (now, notification_id)).rowcount == 1
+            return conn.execute("UPDATE production_notifications SET status='dead_letter', dead_letter_at=?, lease_until=NULL, last_error=?, last_error_at=? WHERE id=? AND status='leased'", (now, error, now, notification_id)).rowcount == 1
         backoff = min(300, 2 ** attempts)
-        return conn.execute("UPDATE production_notifications SET status='pending', lease_until=NULL, next_attempt_at=?, body=body WHERE id=? AND status='leased'", (now + backoff, notification_id)).rowcount == 1
+        return conn.execute("UPDATE production_notifications SET status='pending', lease_until=NULL, next_attempt_at=?, last_error=?, last_error_at=? WHERE id=? AND status='leased'", (now + backoff, error, now, notification_id)).rowcount == 1
 
 
 def register_legacy_incidents(conn: sqlite3.Connection, *, now: int) -> list[str]:

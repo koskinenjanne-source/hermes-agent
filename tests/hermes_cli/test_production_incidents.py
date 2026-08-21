@@ -83,7 +83,8 @@ def test_outbox_claim_ack_retry_and_dead_letter_are_durable(board):
     note = pi.claim_notification(board, now=3)
     assert note
     pi.fail_notification(board, note.id, now=3, error="network", max_attempts=2)
-    assert board.execute("SELECT status FROM production_notifications WHERE id=?", (note.id,)).fetchone()[0] == "dead_letter"
+    row = board.execute("SELECT status,last_error,last_error_at FROM production_notifications WHERE id=?", (note.id,)).fetchone()
+    assert tuple(row) == ("dead_letter", "network", 3)
 
 
 def test_controller_dispatches_only_approved_adapter_and_estop_fails_closed(board):
@@ -168,6 +169,15 @@ def test_coaching_target_and_direct_unbound_ready_transition_are_rejected(board)
         board.execute("UPDATE tasks SET status='ready' WHERE id='p0'")
 
 
+@pytest.mark.parametrize("status", ["ready", "running", "done"])
+def test_direct_insert_of_p0_task_in_dispatchable_state_requires_bound_incident(board, status):
+    with pytest.raises(sqlite3.IntegrityError, match="P0 task"):
+        board.execute(
+            "INSERT INTO tasks (id,title,status,created_at,production_incident_required) VALUES (?,?,?,0,1)",
+            (f"unbound-{status}", "unbound P0", status),
+        )
+
+
 def test_legacy_registration_is_idempotent(board):
     first = pi.register_legacy_incidents(board, now=0)
     second = pi.register_legacy_incidents(board, now=1)
@@ -205,3 +215,24 @@ def test_receipt_requires_live_approved_execution(board):
     )
     with pytest.raises(ValueError, match="raw attestations"):
         pi.accept_verified_receipt(board, incident_id=incident_id, adapter_id="manual", execution_id="forged", fence_token=1, spec_digest=pi.spec_digest(spec()), attestation="verified:forged", now=1)
+
+
+def test_retry_safe_timeout_reclaims_normal_task_run_before_fencing(board):
+    task_id, incident_id = pi.admit_p0_task(
+        board, title="P0", assignee="executor", owner="operator",
+        operator_target="telegram:operator", gate_spec=spec(), now=0,
+        retry_safe=True,
+    )
+    incident = pi.require_approval(board, incident_id, expected_version=1, now=1)
+    incident = pi.grant_approval(board, incident_id, principal="ops", expected_version=incident.version, expires_at=100, now=1, allowed_principals={"ops"})
+    pi.begin_approved_execution(board, incident_id, expected_version=incident.version, now=1)
+    assert kb.claim_task(board, task_id, claimer="test-worker")
+    old_run_id = board.execute("SELECT current_run_id FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
+
+    assert pi.controller_tick(board, now=pi.EVIDENCE_WINDOW_SECONDS + 1).reclaimed == [incident_id]
+
+    task = board.execute("SELECT status,current_run_id,claim_lock FROM tasks WHERE id=?", (task_id,)).fetchone()
+    run = board.execute("SELECT status,outcome,ended_at FROM task_runs WHERE id=?", (old_run_id,)).fetchone()
+    assert tuple(task) == ("triage", None, None)
+    assert run[0:2] == ("reclaimed", "reclaimed") and run[2] is not None
+    assert pi.get_incident(board, incident_id).fence_token == 2
