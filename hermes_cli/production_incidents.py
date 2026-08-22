@@ -7,11 +7,12 @@ contracts which an allowlisted adapter must satisfy.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import secrets
 import sqlite3
 from dataclasses import dataclass, replace
-from typing import Optional, Protocol
+from typing import Callable, Optional, Protocol
 
 EVIDENCE_WINDOW_SECONDS = 30 * 60
 HUMAN_BLOCKED = "human_blocked"
@@ -81,6 +82,50 @@ class AdapterRegistry:
 
     def get(self, adapter_id: str) -> Optional[ProductionAdapter]:
         return self._adapters.get(adapter_id)
+
+
+class ConfiguredHmacAdapter:
+    """A configured verifier trust root, not an operation implementation.
+
+    The adapter can verify a receipt from a separately configured production
+    executor.  It intentionally refuses to execute: enabling a verifier must
+    never turn a configuration entry into an ambient production capability.
+    """
+    def __init__(self, adapter_id: str, secret: str, retry_safe: bool):
+        self.adapter_id = adapter_id
+        self.retry_safe = retry_safe
+        self._secret = secret.encode("utf-8")
+
+    def execute(self, spec: GateSpec, idempotency_key: str, fence_token: int) -> str:
+        raise RuntimeError("configured HMAC adapter is verifier-only; no production executor is registered")
+
+    def verify(self, receipt: Receipt) -> bool:
+        expected = hmac.new(self._secret, receipt_payload(receipt).encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(receipt.attestation, expected)
+
+
+def configured_adapter_registry(config: object, *, secret_resolver: Callable[[str], Optional[str]]) -> AdapterRegistry:
+    """Build the runtime verifier registry solely from configured trust roots."""
+    if not isinstance(config, dict):
+        raise ValueError("production incident configuration must be a mapping")
+    adapters = config.get("adapters", [])
+    if not isinstance(adapters, list):
+        raise ValueError("production incident adapters must be a list")
+    registered: dict[str, ProductionAdapter] = {}
+    for item in adapters:
+        if not isinstance(item, dict):
+            raise ValueError("production incident adapter must be a mapping")
+        adapter_id = str(item.get("id", "")).strip()
+        secret_env = str(item.get("secret_env", "")).strip()
+        if not adapter_id or not secret_env or adapter_id in registered:
+            raise ValueError("production incident adapter requires a unique id and secret_env")
+        secret = secret_resolver(secret_env)
+        if not secret:
+            raise ValueError(f"production incident adapter secret is unavailable: {secret_env}")
+        registered[adapter_id] = ConfiguredHmacAdapter(
+            adapter_id, secret, bool(item.get("retry_safe", False)),
+        )
+    return AdapterRegistry(registered)
 
 
 @dataclass(frozen=True)
@@ -210,11 +255,12 @@ def _outbox(conn: sqlite3.Connection, incident_id: str, target: str, kind: str, 
     conn.execute("INSERT OR IGNORE INTO production_notifications (incident_id,target,dedupe_key,body,next_attempt_at,created_at) VALUES (?,?,?,?,?,?)", (incident_id, target, f"{incident_id}:{kind}", f"P0 {incident_id}: {kind}", now, now))
 
 
-def admit_p0_task(conn: sqlite3.Connection, *, title: str, assignee: str, owner: str, operator_target: str, gate_spec: GateSpec, now: int, adapter_id: str = "manual", retry_safe: bool = False) -> tuple[str, str]:
+def admit_p0_task(conn: sqlite3.Connection, *, title: str, assignee: str, owner: str, operator_target: str, gate_spec: GateSpec, now: int, adapter_id: str = "manual", retry_safe: bool = False, task_id: Optional[str] = None, incident_id: Optional[str] = None) -> tuple[str, str]:
     if not _target_is_safe(operator_target):
         raise ValueError("operator target must be configured outside coaching/Masa")
     digest = spec_digest(gate_spec)
-    task_id, incident_id = "p0_" + secrets.token_hex(8), "pi_" + secrets.token_hex(8)
+    task_id = task_id or "p0_" + secrets.token_hex(8)
+    incident_id = incident_id or "pi_" + secrets.token_hex(8)
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute("INSERT INTO tasks (id,title,assignee,status,created_at,production_incident_required) VALUES (?,?,?,'triage',?,1)", (task_id, title.strip(), assignee, now))
@@ -456,11 +502,32 @@ def fail_notification(conn: sqlite3.Connection, notification_id: int, *, now: in
         return conn.execute("UPDATE production_notifications SET status='pending', lease_until=NULL, next_attempt_at=?, last_error=?, last_error_at=? WHERE id=? AND status='leased'", (now + backoff, error, now, notification_id)).rowcount == 1
 
 
-def register_legacy_incidents(conn: sqlite3.Connection, *, now: int) -> list[str]:
+def register_legacy_incidents(conn: sqlite3.Connection, *, now: int, operator_target: str = "telegram:operator", owner: str = "operator") -> list[str]:
     ids = []
     for issue, adapter, retry in ((335, "manual", False), (328, "manual", False), (336, "manual", False)):
         existing = conn.execute("SELECT id FROM production_incidents WHERE task_id=?", (f"legacy-{issue}",)).fetchone()
         if existing: ids.append(existing[0]); continue
-        task, incident = admit_p0_task(conn, title=f"fitness-system#{issue}", assignee="executor", owner="operator", operator_target="telegram:operator", gate_spec=GateSpec("execute approved production gate", "production impact", "follow documented rollback", "capture verifier receipt", f"fitness-system#{issue}", "production"), now=now, adapter_id=adapter, retry_safe=retry)
-        conn.execute("UPDATE production_incidents SET task_id=? WHERE id=?", (f"legacy-{issue}", incident)); conn.execute("UPDATE tasks SET id=? WHERE id=?", (f"legacy-{issue}", task)); ids.append(incident)
+        _, incident = admit_p0_task(conn, title=f"fitness-system#{issue}", assignee="executor", owner=owner, operator_target=operator_target, gate_spec=GateSpec("execute approved production gate", "production impact", "follow documented rollback", "capture verifier receipt", f"fitness-system#{issue}", "production"), now=now, adapter_id=adapter, retry_safe=retry, task_id=f"legacy-{issue}")
+        ids.append(incident)
     return ids
+
+
+def bootstrap_configured_legacy_incidents(conn: sqlite3.Connection, *, config: object, now: int) -> list[str]:
+    """Register the three retrospective gates on every configured board once.
+
+    No task data selects the owner or delivery route.  Missing trust roots are
+    a hard error so startup cannot silently create unroutable P0 obligations.
+    """
+    if not isinstance(config, dict) or not config.get("legacy_registrations", False):
+        return []
+    targets = config.get("operator_targets")
+    principals = config.get("approval_principals")
+    if not isinstance(targets, list) or len(targets) != 1 or not isinstance(principals, list) or not principals:
+        raise ValueError("production incident configured legacy bootstrap requires exactly one operator target and approval trust roots")
+    target = str(targets[0]).strip()
+    if not _target_is_safe(target):
+        raise ValueError("operator target must be configured outside coaching/Masa")
+    owner = str(config.get("legacy_owner", "operator")).strip()
+    if not owner:
+        raise ValueError("production incident legacy owner is required")
+    return register_legacy_incidents(conn, now=now, operator_target=target, owner=owner)

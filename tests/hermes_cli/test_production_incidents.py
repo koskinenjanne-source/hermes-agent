@@ -117,6 +117,47 @@ def test_gateway_controller_acknowledges_only_configured_operator_outbox(board, 
     assert board.execute("SELECT status FROM production_notifications WHERE incident_id=?", (incident_id,)).fetchone()[0] == "acknowledged"
 
 
+def test_gateway_bootstraps_configured_legacy_incidents_and_registry(board, monkeypatch):
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as config
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.adapters = {Platform.TELEGRAM: OperatorAdapter()}
+    db_path = board.execute("PRAGMA database_list").fetchone()[2]
+    monkeypatch.setenv("HERMES_KANBAN_DB", db_path)
+    monkeypatch.setenv("P0_RECEIPT_KEY", "receipt-key")
+    monkeypatch.setattr(config, "load_config", lambda: {"production_incidents": {
+        "operator_targets": ["telegram:operator"], "approval_principals": ["telegram:42"],
+        "legacy_registrations": True,
+        "adapters": [{"id": "ops-hmac", "secret_env": "P0_RECEIPT_KEY"}],
+    }})
+    asyncio.run(runner._production_incident_tick())
+    assert board.execute("SELECT COUNT(*) FROM production_incidents").fetchone()[0] == 3
+    assert runner._production_adapter_registry.get("ops-hmac") is not None
+
+
+def test_gateway_approval_command_uses_authenticated_configured_principal(board, monkeypatch):
+    from gateway.config import Platform
+    from gateway.platforms.base import MessageEvent
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+    import hermes_cli.config as config
+
+    _, incident_id = pi.admit_p0_task(board, title="P0", assignee="executor", owner="operator", operator_target="telegram:operator", gate_spec=spec(), now=0)
+    pi.require_approval(board, incident_id, expected_version=1, now=1)
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._is_user_authorized = lambda source: True
+    db_path = board.execute("PRAGMA database_list").fetchone()[2]
+    monkeypatch.setenv("HERMES_KANBAN_DB", db_path)
+    monkeypatch.setattr(config, "load_config", lambda: {"production_incidents": {
+        "operator_targets": ["telegram:operator"], "approval_principals": ["telegram:42"],
+    }})
+    event = MessageEvent(text=f"/production-approve {incident_id} 2 4000000000", source=SessionSource(platform=Platform.TELEGRAM, chat_id="operator", chat_type="dm", user_id="42"))
+    assert asyncio.run(runner._handle_production_approve_command(event)) == "Production approval recorded."
+    assert pi.get_incident(board, incident_id).state == "approved_dispatching"
+
+
 def test_p0_admission_is_bound_and_completion_requires_verified_evidence(board):
     task_id, incident_id = pi.admit_p0_task(board, title="P0 gate", assignee="executor", owner="operator", operator_target="telegram:operator", gate_spec=spec(), now=100, adapter_id="signed")
     assert board.execute("SELECT production_incident_required FROM tasks WHERE id=?", (task_id,)).fetchone()[0] == 1
@@ -183,6 +224,24 @@ def test_legacy_registration_is_idempotent(board):
     second = pi.register_legacy_incidents(board, now=1)
     assert first == second
     assert len(first) == 3
+
+
+def test_configured_legacy_bootstrap_and_hmac_adapter_are_fail_closed(board):
+    config = {
+        "operator_targets": ["telegram:operator"],
+        "approval_principals": ["telegram:42"],
+        "legacy_registrations": True,
+        "adapters": [{"id": "ops-hmac", "secret_env": "P0_RECEIPT_KEY", "retry_safe": False}],
+    }
+    registry = pi.configured_adapter_registry(config, secret_resolver=lambda key: "receipt-key" if key == "P0_RECEIPT_KEY" else None)
+    assert registry.get("ops-hmac") is not None
+    assert len(pi.bootstrap_configured_legacy_incidents(board, config=config, now=0)) == 3
+    assert len(pi.bootstrap_configured_legacy_incidents(board, config=config, now=1)) == 3
+    assert board.execute("SELECT COUNT(*) FROM production_incidents").fetchone()[0] == 3
+    with pytest.raises(ValueError, match="secret"):
+        pi.configured_adapter_registry(config, secret_resolver=lambda _: None)
+    with pytest.raises(ValueError, match="trust roots"):
+        pi.bootstrap_configured_legacy_incidents(board, config={"legacy_registrations": True}, now=2)
 
 
 def test_unapproved_p0_task_never_enters_normal_dispatch(board):

@@ -147,13 +147,20 @@ class GatewayKanbanWatchersMixin:
         """
         from hermes_cli import kanban_db as _kb
         from hermes_cli import production_incidents as _pi
+        from hermes_cli.config import get_env_value as _get_env_value
         from hermes_cli.config import load_config as _load_config
         from gateway.config import Platform as _Platform
         try:
             cfg = _load_config().get("production_incidents", {})
             targets = set(cfg.get("operator_targets", []))
             principals = set(cfg.get("approval_principals", []))
-            registry = getattr(self, "_production_adapter_registry", _pi.AdapterRegistry())
+            # Rebuild only from config + profile-safe secret resolution.  A
+            # worker, task, subscription, or a test-injected runner attribute
+            # cannot choose a production verifier.
+            registry = _pi.configured_adapter_registry(
+                cfg, secret_resolver=_get_env_value,
+            )
+            self._production_adapter_registry = registry
             if not targets or not principals:
                 logger.error("production incident controller: missing configured trust roots; refusing P0 delivery")
                 return
@@ -165,6 +172,9 @@ class GatewayKanbanWatchersMixin:
                 def _control():
                     conn = _kb.connect(board=slug)
                     try:
+                        _pi.bootstrap_configured_legacy_incidents(
+                            conn, config=cfg, now=now,
+                        )
                         _pi.controller_tick(conn, now=now, registry=registry, estop_engaged=estop)
                         return _pi.claim_notification(conn, now=now)
                     finally:

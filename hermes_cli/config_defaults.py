@@ -2384,6 +2384,17 @@ DEFAULT_CONFIG = {
         "reconcile_orphans": True,
     },
 
+    # Production incidents are fail-closed and inert until an operator
+    # explicitly provisions every trust root. Secrets are env references only;
+    # never place receipt keys in config.yaml.
+    "production_incidents": {
+        "operator_targets": [],
+        "approval_principals": [],
+        "adapters": [],  # [{id, secret_env, retry_safe}]
+        "legacy_registrations": False,
+        "legacy_owner": "operator",
+    },
+
     # execute_code settings — controls the tool used for programmatic tool calls.
     "code_execution": {
         # Execution mode:
