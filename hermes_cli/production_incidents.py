@@ -196,6 +196,12 @@ def install_schema(conn: sqlite3.Connection) -> None:
       spec_digest TEXT NOT NULL, adapter_id TEXT NOT NULL, dispatched_at INTEGER NOT NULL,
       PRIMARY KEY(incident_id, execution_id, fence_token)
     );
+    CREATE TABLE IF NOT EXISTS production_execution_claims (
+      incident_id TEXT NOT NULL, fence_token INTEGER NOT NULL,
+      spec_digest TEXT NOT NULL, adapter_id TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL, claimed_at INTEGER NOT NULL,
+      PRIMARY KEY(incident_id, fence_token)
+    );
     CREATE TABLE IF NOT EXISTS production_incident_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT, incident_id TEXT NOT NULL, kind TEXT NOT NULL,
       payload TEXT NOT NULL, created_at INTEGER NOT NULL
@@ -420,6 +426,93 @@ def _quarantine_normal_task(conn: sqlite3.Connection, task_id: str, *, now: int)
     )
 
 
+def _block_incident(conn: sqlite3.Connection, incident: Incident, *, now: int, reason: str, error: str | None = None) -> Incident:
+    """Fence a runnable task before atomically recording a human-only block."""
+    _quarantine_normal_task(conn, incident.task_id, now=now)
+    payload = {"reason": reason}
+    if error:
+        payload["error"] = error[:200]
+    blocked = _cas(conn, incident.id, incident.version, state=HUMAN_BLOCKED, now=now)
+    _event(conn, incident.id, HUMAN_BLOCKED, now, **payload)
+    target = conn.execute(
+        "SELECT operator_target FROM production_incidents WHERE id=?", (incident.id,),
+    ).fetchone()[0]
+    _outbox(conn, incident.id, target, HUMAN_BLOCKED, now)
+    return blocked
+
+
+def _claim_adapter_execution(conn: sqlite3.Connection, incident_id: str, *, expected_version: int, now: int) -> Incident:
+    """Persist sole adapter ownership before any external execution can begin."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        incident = get_incident(conn, incident_id)
+        if (
+            incident.version != expected_version
+            or incident.state != "approved_executing"
+            or incident.evidence_deadline <= now
+        ):
+            raise StateConflict("incident is not eligible for adapter dispatch")
+        idempotency_key = f"{incident.id}:{incident.spec_digest}"
+        conn.execute(
+            "INSERT INTO production_execution_claims VALUES (?,?,?,?,?,?)",
+            (incident.id, incident.fence_token, incident.spec_digest, incident.adapter_id, idempotency_key, now),
+        )
+        _quarantine_normal_task(conn, incident.task_id, now=now)
+        claimed = _cas(conn, incident.id, expected_version, state="adapter_dispatching", now=now)
+        _event(conn, incident.id, "adapter_claimed", now, fence=incident.fence_token)
+        conn.execute("COMMIT")
+        return claimed
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def _record_adapter_execution(conn: sqlite3.Connection, incident: Incident, execution_id: str, *, now: int) -> Incident:
+    """Bind an adapter result to the exact committed claim before verification."""
+    with conn:
+        current = get_incident(conn, incident.id)
+        claim = conn.execute(
+            "SELECT spec_digest,adapter_id,idempotency_key FROM production_execution_claims "
+            "WHERE incident_id=? AND fence_token=?",
+            (incident.id, incident.fence_token),
+        ).fetchone()
+        if (
+            current.version != incident.version
+            or current.state != "adapter_dispatching"
+            or current.fence_token != incident.fence_token
+            or current.spec_digest != incident.spec_digest
+            or not claim
+            or tuple(claim) != (incident.spec_digest, incident.adapter_id, f"{incident.id}:{incident.spec_digest}")
+        ):
+            raise StateConflict("adapter result does not match the active execution claim")
+        conn.execute(
+            "INSERT INTO production_executions VALUES (?,?,?,?,?,?)",
+            (incident.id, execution_id, incident.fence_token, incident.spec_digest, incident.adapter_id, now),
+        )
+        verified = _cas(conn, incident.id, incident.version, state="verifying", now=now)
+        _event(conn, incident.id, "adapter_dispatched", now, execution_id=execution_id, fence=incident.fence_token)
+    return verified
+
+
+def _execution_claim_is_live(conn: sqlite3.Connection, incident: Incident) -> bool:
+    """Last fail-closed check before adapter I/O after a separately committed claim."""
+    current = get_incident(conn, incident.id)
+    claim = conn.execute(
+        "SELECT 1 FROM production_execution_claims "
+        "WHERE incident_id=? AND fence_token=? AND spec_digest=? AND adapter_id=? "
+        "AND idempotency_key=?",
+        (incident.id, incident.fence_token, incident.spec_digest, incident.adapter_id,
+         f"{incident.id}:{incident.spec_digest}"),
+    ).fetchone()
+    return bool(
+        claim
+        and current.version == incident.version
+        and current.state == "adapter_dispatching"
+        and current.fence_token == incident.fence_token
+        and current.spec_digest == incident.spec_digest
+    )
+
+
 def controller_tick(conn: sqlite3.Connection, *, now: int, registry: Optional[AdapterRegistry] = None, estop_engaged: bool = False) -> TickResult:
     reclaimed: list[str] = []; blocked: list[str] = []; dispatched: list[str] = []
     # e-stop is fail-closed for every non-terminal P0 incident: create an
@@ -428,48 +521,52 @@ def controller_tick(conn: sqlite3.Connection, *, now: int, registry: Optional[Ad
         rows = conn.execute("SELECT id,version,operator_target FROM production_incidents WHERE state NOT IN (?,?)", (COMPLETED, HUMAN_BLOCKED)).fetchall()
         for incident_id, version, target in rows:
             with conn:
-                _cas(conn, incident_id, version, state=HUMAN_BLOCKED, now=now)
-                _event(conn, incident_id, HUMAN_BLOCKED, now, reason="global emergency stop engaged")
-                _outbox(conn, incident_id, target, HUMAN_BLOCKED, now)
+                incident = get_incident(conn, incident_id)
+                if incident.version != version:
+                    continue
+                _block_incident(conn, incident, now=now, reason="global emergency stop engaged")
                 blocked.append(incident_id)
         return TickResult(reclaimed, blocked, dispatched)
     rows = conn.execute("SELECT id,version,state,retry_safe,operator_target FROM production_incidents WHERE state NOT IN (?,?) AND evidence_deadline <= ?", (COMPLETED, HUMAN_BLOCKED, now)).fetchall()
     for incident_id, version, state, retry_safe, target in rows:
         with conn:
-            if retry_safe:
-                incident = get_incident(conn, incident_id)
+            incident = get_incident(conn, incident_id)
+            if incident.version != version or incident.state != state:
+                continue
+            if state == "adapter_dispatching" or not retry_safe:
+                _block_incident(conn, incident, now=now, reason="evidence deadline elapsed")
+                blocked.append(incident_id)
+            elif retry_safe:
                 _quarantine_normal_task(conn, incident.task_id, now=now)
                 updated = _cas(conn, incident_id, version, state="reclaiming", now=now, fence_token=incident.fence_token + 1)
                 _event(conn, incident_id, "reclaimed", now, fence=updated.fence_token); reclaimed.append(incident_id)
-            else:
-                _cas(conn, incident_id, version, state=HUMAN_BLOCKED, now=now)
-                _event(conn, incident_id, HUMAN_BLOCKED, now, reason="evidence deadline elapsed")
-                _outbox(conn, incident_id, target, HUMAN_BLOCKED, now); blocked.append(incident_id)
     if registry:
         rows = conn.execute("SELECT id,version FROM production_incidents WHERE state='approved_executing'").fetchall()
         for incident_id, version in rows:
-            with conn:
-                incident = get_incident(conn, incident_id)
-                adapter = registry.get(incident.adapter_id)
-                if adapter is None:
-                    _cas(conn, incident_id, version, state=HUMAN_BLOCKED, now=now)
-                    _event(conn, incident_id, HUMAN_BLOCKED, now, reason="configured adapter unavailable")
-                    _outbox(conn, incident_id, conn.execute("SELECT operator_target FROM production_incidents WHERE id=?", (incident_id,)).fetchone()[0], HUMAN_BLOCKED, now)
-                    blocked.append(incident_id)
+            try:
+                incident = _claim_adapter_execution(conn, incident_id, expected_version=version, now=now)
+            except StateConflict:
+                continue
+            adapter = registry.get(incident.adapter_id)
+            if adapter is None:
+                with conn:
+                    _block_incident(conn, get_incident(conn, incident_id), now=now, reason="configured adapter unavailable")
+                blocked.append(incident_id)
+                continue
+            try:
+                if not _execution_claim_is_live(conn, incident):
                     continue
-                try:
-                    execution_id = adapter.execute(_gate_spec(conn, incident), f"{incident.id}:{incident.spec_digest}", incident.fence_token)
-                    if not execution_id:
-                        raise ValueError("adapter returned no execution identity")
-                    conn.execute("INSERT INTO production_executions VALUES (?,?,?,?,?,?)", (incident.id, str(execution_id), incident.fence_token, incident.spec_digest, incident.adapter_id, now))
-                    _cas(conn, incident_id, version, state="verifying", now=now)
-                    _event(conn, incident_id, "adapter_dispatched", now, execution_id=str(execution_id), fence=incident.fence_token)
-                    dispatched.append(incident_id)
-                except Exception as exc:
-                    _cas(conn, incident_id, version, state=HUMAN_BLOCKED, now=now)
-                    _event(conn, incident_id, HUMAN_BLOCKED, now, reason="adapter dispatch failed", error=str(exc)[:200])
-                    _outbox(conn, incident_id, conn.execute("SELECT operator_target FROM production_incidents WHERE id=?", (incident_id,)).fetchone()[0], HUMAN_BLOCKED, now)
-                    blocked.append(incident_id)
+                execution_id = adapter.execute(_gate_spec(conn, incident), f"{incident.id}:{incident.spec_digest}", incident.fence_token)
+                if not execution_id:
+                    raise ValueError("adapter returned no execution identity")
+                _record_adapter_execution(conn, incident, str(execution_id), now=now)
+                dispatched.append(incident_id)
+            except Exception as exc:
+                with conn:
+                    current = get_incident(conn, incident_id)
+                    if current.state != HUMAN_BLOCKED:
+                        _block_incident(conn, current, now=now, reason="adapter dispatch failed", error=str(exc))
+                blocked.append(incident_id)
     return TickResult(reclaimed, blocked, dispatched)
 
 

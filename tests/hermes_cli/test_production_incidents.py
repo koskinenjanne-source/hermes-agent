@@ -4,6 +4,8 @@ import hashlib
 import hmac
 import sqlite3
 import asyncio
+import threading
+from pathlib import Path
 
 import pytest
 
@@ -53,6 +55,22 @@ class SignedAdapter:
         return hmac.compare_digest(receipt.attestation, expected)
 
 
+class BlockingAdapter(SignedAdapter):
+    """Makes overlapping controller dispatch attempts observable without I/O."""
+
+    def __init__(self):
+        super().__init__()
+        self.entered = threading.Event()
+        self._lock = threading.Lock()
+
+    def execute(self, spec, idempotency_key, fence_token):
+        with self._lock:
+            self.executions.append((spec, idempotency_key, fence_token))
+            self.entered.set()
+        assert self.entered.wait(timeout=0.5)
+        return "execution-1"
+
+
 def _approved_execution(board, *, adapter_id="signed"):
     _, incident_id = pi.admit_p0_task(board, title="P0", assignee="executor", owner="operator", operator_target="telegram:operator", gate_spec=spec(), now=0, adapter_id=adapter_id)
     incident = pi.require_approval(board, incident_id, expected_version=1, now=1)
@@ -97,6 +115,57 @@ def test_controller_dispatches_only_approved_adapter_and_estop_fails_closed(boar
     _, blocked_id = pi.admit_p0_task(board, title="P0", assignee="executor", owner="operator", operator_target="telegram:operator", gate_spec=spec(), now=0)
     result = pi.controller_tick(board, now=2, registry=registry, estop_engaged=True)
     assert blocked_id in result.blocked
+
+
+def test_concurrent_controller_ticks_execute_non_retry_safe_adapter_once(board):
+    incident = _approved_execution(board)
+    adapter = BlockingAdapter()
+    registry = pi.AdapterRegistry({adapter.adapter_id: adapter})
+    db_path = board.execute("PRAGMA database_list").fetchone()[2]
+    failures = []
+
+    def tick():
+        with kb.connect(Path(db_path)) as conn:
+            try:
+                pi.controller_tick(conn, now=2, registry=registry)
+            except Exception as exc:
+                failures.append(exc)
+
+    first = threading.Thread(target=tick)
+    second = threading.Thread(target=tick)
+    first.start()
+    assert adapter.entered.wait(timeout=1)
+    second.start()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert failures == []
+    assert len(adapter.executions) == 1
+    assert pi.get_incident(board, incident.id).state == "verifying"
+
+
+@pytest.mark.parametrize("estop_engaged", [True, False])
+def test_blocking_paths_quarantine_running_p0_task(board, estop_engaged):
+    task_id, incident_id = pi.admit_p0_task(
+        board, title="P0", assignee="executor", owner="operator",
+        operator_target="telegram:operator", gate_spec=spec(), now=0,
+        retry_safe=False,
+    )
+    incident = pi.require_approval(board, incident_id, expected_version=1, now=1)
+    incident = pi.grant_approval(board, incident_id, principal="ops", expected_version=incident.version, expires_at=100, now=1, allowed_principals={"ops"})
+    pi.begin_approved_execution(board, incident_id, expected_version=incident.version, now=1)
+    assert kb.claim_task(board, task_id, claimer="test-worker")
+
+    pi.controller_tick(
+        board,
+        now=2 if estop_engaged else pi.EVIDENCE_WINDOW_SECONDS,
+        estop_engaged=estop_engaged,
+    )
+
+    task = board.execute("SELECT status,current_run_id,claim_lock,worker_pid FROM tasks WHERE id=?", (task_id,)).fetchone()
+    assert tuple(task) == ("triage", None, None, None)
+    assert pi.get_incident(board, incident_id).state == pi.HUMAN_BLOCKED
 
 
 def test_gateway_controller_acknowledges_only_configured_operator_outbox(board, monkeypatch):

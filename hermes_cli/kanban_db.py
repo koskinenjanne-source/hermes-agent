@@ -4922,7 +4922,18 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND (
+                       status IN ('running', 'ready', 'blocked')
+                       OR (
+                           status = 'triage'
+                           AND production_incident_required = 1
+                           AND EXISTS (
+                               SELECT 1 FROM production_incidents
+                               WHERE task_id = tasks.id
+                                 AND state = 'production_completed'
+                           )
+                       )
+                   )
                 """,
                 (result, now, task_id),
             )
