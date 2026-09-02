@@ -1,6 +1,7 @@
 """Tests for gateway service management helpers."""
 
 import os
+import plistlib
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -231,6 +232,35 @@ class TestGeneratedSystemdUnits:
 
         assert str(local_bin) in plist
         assert str(profile_node_bin) not in plist
+
+    def test_launchd_plist_persists_configured_nofile_soft_limit(self, monkeypatch):
+        """The generated plist must carry SoftResourceLimits/NumberOfFiles so a
+        plist rewrite by `hermes gateway start` cannot strip the FD floor and
+        reintroduce EMFILE crashes (launchd default soft limit is 256)."""
+        import hermes_cli.resource_limits as resource_limits
+
+        monkeypatch.setattr(
+            resource_limits, "configured_nofile_soft_limit", lambda config=None: 65536
+        )
+
+        plist = gateway_cli.generate_launchd_plist()
+
+        assert "<key>SoftResourceLimits</key>" in plist
+        assert "<key>NumberOfFiles</key>" in plist
+        assert "<integer>65536</integer>" in plist
+
+    def test_launchd_plist_omits_nofile_block_when_disabled(self, monkeypatch):
+        """runtime.nofile_soft_limit: 0/false/null disables the adjustment; the
+        plist must then not contain a SoftResourceLimits block at all."""
+        import hermes_cli.resource_limits as resource_limits
+
+        monkeypatch.setattr(
+            resource_limits, "configured_nofile_soft_limit", lambda config=None: None
+        )
+
+        plist = gateway_cli.generate_launchd_plist()
+
+        assert "SoftResourceLimits" not in plist
 
 
 
@@ -1193,7 +1223,33 @@ class TestProfileArg:
         assert "--profile mybot gateway run" in unit
         assert f'HERMES_HOME={target_home / ".hermes" / "profiles" / "mybot"}' in unit
 
+    def test_launchd_plist_wraps_gateway_stderr_with_timestamps(self, tmp_path, monkeypatch):
+        profile_dir = tmp_path / ".hermes" / "profiles" / "mybot"
+        profile_dir.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(profile_dir))
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: profile_dir)
+        monkeypatch.setattr(gateway_cli, "get_python_path", lambda: "/usr/bin/python3")
 
+        plist = gateway_cli.generate_launchd_plist()
+        program_args = plistlib.loads(plist.encode("utf-8"))["ProgramArguments"]
+
+        assert program_args == [
+            "/usr/bin/python3",
+            "-m",
+            "hermes_cli.stderr_timestamp",
+            "--error-log",
+            str(profile_dir / "logs" / "gateway.error.log"),
+            "--",
+            "/usr/bin/python3",
+            "-m",
+            "hermes_cli.main",
+            "--profile",
+            "mybot",
+            "gateway",
+            "run",
+            "--replace",
+        ]
 
     def test_launchd_plist_path_uses_real_user_home_not_profile_home(self, tmp_path, monkeypatch):
         profile_dir = tmp_path / ".hermes" / "profiles" / "orcha"
@@ -1974,7 +2030,6 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
         )
         assert ok is True
         assert attempts["bootstrap"] >= 2  # the timeout was retried, not raised
-
     def test_registered_but_not_running_is_not_success(self, monkeypatch):
         """A definition with no PID must not end the loop.
 
@@ -2005,4 +2060,3 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
         )
         assert ok is False
         assert list_calls["n"] >= 1
-

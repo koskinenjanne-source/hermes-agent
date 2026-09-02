@@ -451,7 +451,39 @@ class SessionSchemaMixin:
 
         Adding a column to SCHEMA_SQL is all that's needed; the
         reconciliation loop picks it up automatically.
+
+        The parse result is memoized on disk keyed by a hash of the DDL:
+        executing SCHEMA_SQL (FTS5 virtual tables included) in the scratch
+        DB costs ~85ms on every startup, but the output is a pure function
+        of the DDL text, which only changes when the shipped code changes.
+        Reconciliation itself (diffing the LIVE database) still runs every
+        startup — only the reference-side parse is cached. A corrupt or
+        stale cache degrades to recomputation.
         """
+        import hashlib as _hashlib
+        import json as _json
+
+        cache_path = None
+        schema_hash = _hashlib.sha256(schema_sql.encode("utf-8")).hexdigest()
+        try:
+            from hermes_constants import get_hermes_home
+            cache_path = get_hermes_home() / "cache" / "schema_columns.json"
+            blob = _json.loads(cache_path.read_text(encoding="utf-8"))
+            if (
+                isinstance(blob, dict)
+                and blob.get("schema_hash") == schema_hash
+                and isinstance(blob.get("tables"), dict)
+            ):
+                tables = blob["tables"]
+                if all(
+                    isinstance(cols, dict)
+                    and all(isinstance(v, str) for v in cols.values())
+                    for cols in tables.values()
+                ):
+                    return tables
+        except Exception:
+            pass  # missing/corrupt cache → recompute below
+
         ref = sqlite3.connect(":memory:")
         try:
             ref.executescript(schema_sql)
@@ -478,9 +510,25 @@ class SessionSchemaMixin:
                         parts.append(f"DEFAULT {default}")
                     cols[col_name] = " ".join(parts)
                 table_columns[tbl] = cols
-            return table_columns
         finally:
             ref.close()
+
+        if cache_path is not None:
+            try:
+                import os as _os
+                import tempfile as _tempfile
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                fd, tmp = _tempfile.mkstemp(
+                    dir=str(cache_path.parent), prefix=".schema_columns."
+                )
+                with _os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    _json.dump(
+                        {"schema_hash": schema_hash, "tables": table_columns}, fh
+                    )
+                _os.replace(tmp, cache_path)
+            except Exception:
+                pass  # cache write is best-effort
+        return table_columns
 
     def _reconcile_columns(self, cursor: sqlite3.Cursor) -> None:
         """Ensure live tables have every column declared in SCHEMA_SQL.
@@ -518,12 +566,35 @@ class SessionSchemaMixin:
                             f'ALTER TABLE "{table_name}" ADD COLUMN "{safe_name}" {col_type}'
                         )
                     except sqlite3.OperationalError as exc:
-                        # Expected: "duplicate column name" from a race or
-                        # re-run.  Unexpected: "Cannot add a NOT NULL column
-                        # with default value NULL" from a schema mistake.
-                        # Log at DEBUG so it's visible in agent.log.
-                        logger.debug(
-                            "reconcile %s.%s: %s", table_name, col_name, exc,
+                        message = str(exc).lower()
+                        if "duplicate column" in message:
+                            # Expected: a sibling process won the race to ADD
+                            # this column between our PRAGMA diff and the
+                            # ALTER. The store ends up correct either way.
+                            logger.debug(
+                                "reconcile %s.%s: %s", table_name, col_name, exc,
+                            )
+                            continue
+                        if "locked" in message or "busy" in message:
+                            # Lock contention (e.g. an orphaned sibling
+                            # backend holding the write lock, #79531). This
+                            # used to be swallowed at DEBUG, leaving the
+                            # store half-reconciled: startup "succeeded" and
+                            # every session-list read then failed with
+                            # "no such column" until an unrelated writable
+                            # open. Re-raise instead so the open-time lock
+                            # patience in _connect_and_init_with_lock_patience
+                            # retries the WHOLE init (executescript is
+                            # idempotent CREATE IF NOT EXISTS) with jittered
+                            # backoff rather than serving a stale schema.
+                            raise
+                        # Anything else ("Cannot add a NOT NULL column with
+                        # default value NULL", ...) is a schema mistake that
+                        # permanently strands the store behind SCHEMA_SQL —
+                        # be loud, don't bury it at DEBUG.
+                        logger.warning(
+                            "reconcile %s.%s failed; store remains behind "
+                            "SCHEMA_SQL: %s", table_name, col_name, exc,
                         )
 
     def _heal_gateway_routing_pk(self, cursor: sqlite3.Cursor) -> None:
@@ -863,6 +934,7 @@ class SessionSchemaMixin:
             if current_version < 16:
                 # v16: tag delegate subagent rows so pickers stay clean after
                 # parent deletes that used to orphan them (parent_session_id → NULL).
+                # The shared predicate excludes user-visible reset children.
                 try:
                     cursor.execute(
                         "UPDATE sessions SET model_config = json_set("
