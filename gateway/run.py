@@ -12767,6 +12767,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # when another gateway owns the single dispatcher.
         self._spawn_supervised(self._kanban_notifier_watcher, "kanban_notifier_watcher")
 
+        # P0 incident control is deliberately independent of the ordinary
+        # Kanban dispatcher/notifier best-effort paths.
+        self._spawn_supervised(self._production_incident_watcher, "production_incident_watcher")
+
         # Start background kanban dispatcher — spawns workers for ready
         # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
         # When false, users run `hermes kanban daemon` externally or
@@ -15672,6 +15676,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "context": self._handle_context_command,
                 "restart": self._handle_restart_command,
                 "approve": self._handle_approve_command,
+                "production-approve": self._handle_production_approve_command,
+                "production-receipt": self._handle_production_receipt_command,
                 "deny": self._handle_deny_command,
                 "pause": self._handle_pause_command,
                 "agents": self._handle_agents_command,
@@ -16943,6 +16949,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "kanban":
             return await self._handle_kanban_command(event)
+
+        if canonical == "production-approve":
+            return await self._handle_production_approve_command(event)
+
+        if canonical == "production-receipt":
+            return await self._handle_production_receipt_command(event)
 
         if canonical == "suggestions":
             return await self._handle_suggestions_command(event)

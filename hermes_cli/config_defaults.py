@@ -2519,6 +2519,22 @@ DEFAULT_CONFIG = {
         "done_sub_retention_days": 30,
     },
 
+    # Production incidents are fail-closed and inert until an operator
+    # explicitly provisions every trust root. Secrets are env references only;
+    # never place receipt keys in config.yaml.
+    "production_incidents": {
+        "operator_targets": [],
+        # Symbolic trust roots map to physical destinations here.  For example:
+        # {"telegram:operator": {"chat_id": "-100...", "thread_id": "123"}}.
+        # Never put physical chat/topic IDs in operator_targets.
+        "operator_routes": {},
+        "approval_principals": [],
+        "receipt_principals": [],
+        "adapters": [],  # [{id, secret_env, retry_safe}]
+        "legacy_registrations": False,
+        "legacy_owner": "operator",
+    },
+
     # execute_code settings — controls the tool used for programmatic tool calls.
     "code_execution": {
         # Execution mode:

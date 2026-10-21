@@ -2679,6 +2679,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    # Production incidents own their own additive schema and persistent
+    # invariants. Import lazily to keep the normal Kanban import graph narrow.
+    from hermes_cli import production_incidents
+    production_incidents.install_schema(conn)
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -5452,7 +5457,18 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND (
+                       status IN ('running', 'ready', 'blocked', 'review')
+                       OR (
+                           status = 'triage'
+                           AND production_incident_required = 1
+                           AND EXISTS (
+                               SELECT 1 FROM production_incidents
+                               WHERE task_id = tasks.id
+                                 AND state = 'production_completed'
+                           )
+                       )
+                   )
                 """,
                 (result, now, task_id),
             )
