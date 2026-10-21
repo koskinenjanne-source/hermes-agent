@@ -220,7 +220,7 @@ class GatewayKanbanWatchersMixin:
                 note = await asyncio.to_thread(_control)
                 if not note:
                     continue
-                if note.target not in targets or not _pi.operator_target_is_safe(note.target):
+                if not _pi.operator_target_is_safe(note.target, trusted_targets=targets):
                     def _dead_letter():
                         conn = _kb.connect(board=slug)
                         try: _pi.fail_notification(conn, note.id, now=now, error="unconfigured operator target", max_attempts=1)

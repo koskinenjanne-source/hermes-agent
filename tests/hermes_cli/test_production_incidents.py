@@ -199,7 +199,8 @@ def test_gateway_bootstraps_configured_legacy_incidents_and_registry(board, monk
     monkeypatch.setattr(config, "load_config", lambda: {"production_incidents": {
         "operator_targets": ["telegram:operator"], "approval_principals": ["telegram:42"],
         "legacy_registrations": True,
-        "adapters": [{"id": "ops-hmac", "secret_env": "P0_RECEIPT_KEY"}],
+        "legacy_adapter_id": "ops-hmac",
+        "adapters": [{"id": "ops-hmac", "secret_env": "P0_RECEIPT_KEY", "execution": "manual"}],
     }})
     asyncio.run(runner._production_incident_tick())
     assert board.execute("SELECT COUNT(*) FROM production_incidents").fetchone()[0] == 3
@@ -300,7 +301,8 @@ def test_configured_legacy_bootstrap_and_hmac_adapter_are_fail_closed(board):
         "operator_targets": ["telegram:operator"],
         "approval_principals": ["telegram:42"],
         "legacy_registrations": True,
-        "adapters": [{"id": "ops-hmac", "secret_env": "P0_RECEIPT_KEY", "retry_safe": False}],
+        "legacy_adapter_id": "ops-hmac",
+        "adapters": [{"id": "ops-hmac", "secret_env": "P0_RECEIPT_KEY", "execution": "manual", "retry_safe": False}],
     }
     registry = pi.configured_adapter_registry(config, secret_resolver=lambda key: "receipt-key" if key == "P0_RECEIPT_KEY" else None)
     assert registry.get("ops-hmac") is not None
@@ -311,6 +313,138 @@ def test_configured_legacy_bootstrap_and_hmac_adapter_are_fail_closed(board):
         pi.configured_adapter_registry(config, secret_resolver=lambda _: None)
     with pytest.raises(ValueError, match="trust roots"):
         pi.bootstrap_configured_legacy_incidents(board, config={"legacy_registrations": True}, now=2)
+
+
+def test_configured_legacy_manual_executor_completes_only_after_a_verified_receipt(board):
+    config = {
+        "operator_targets": ["telegram:operator"],
+        "approval_principals": ["telegram:42"],
+        "legacy_registrations": True,
+        "legacy_adapter_id": "manual-receipt",
+        "adapters": [{
+            "id": "manual-receipt",
+            "secret_env": "P0_RECEIPT_KEY",
+            "execution": "manual",
+            "retry_safe": False,
+        }],
+    }
+    registry = pi.configured_adapter_registry(
+        config, secret_resolver=lambda key: "receipt-key" if key == "P0_RECEIPT_KEY" else None,
+    )
+    incident_id = pi.bootstrap_configured_legacy_incidents(board, config=config, now=0)[0]
+    incident = pi.require_approval(board, incident_id, expected_version=1, now=1)
+    incident = pi.grant_approval(
+        board, incident_id, principal="telegram:42", expected_version=incident.version,
+        expires_at=100, now=1, allowed_principals={"telegram:42"},
+    )
+    pi.begin_approved_execution(board, incident_id, expected_version=incident.version, now=1)
+
+    dispatched = pi.controller_tick(board, now=2, registry=registry)
+    assert dispatched.dispatched == [incident_id]
+    verifying = pi.get_incident(board, incident_id)
+    assert verifying.state == "verifying"
+    execution_id = board.execute(
+        "SELECT execution_id FROM production_executions WHERE incident_id=?", (incident_id,)
+    ).fetchone()[0]
+    assert board.execute(
+        "SELECT body FROM production_notifications WHERE incident_id=? AND dedupe_key LIKE ?",
+        (incident_id, f"%receipt_required:{execution_id}"),
+    ).fetchone()[0] == f"P0 {incident_id}: receipt required for execution {execution_id}"
+    unsigned = pi.Receipt(
+        incident_id, "manual-receipt", execution_id, verifying.fence_token,
+        verifying.spec_digest, "",
+    )
+    receipt = unsigned.__class__(**{
+        **unsigned.__dict__,
+        "attestation": hmac.new(
+            b"receipt-key", pi.receipt_payload(unsigned).encode(), hashlib.sha256,
+        ).hexdigest(),
+    })
+    assert pi.accept_adapter_receipt(board, receipt, registry=registry, now=3).state == pi.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "adapter, match",
+    [
+        ({"id": "manual", "secret_env": "P0_RECEIPT_KEY"}, "manual executor"),
+        ({"id": "other", "secret_env": "P0_RECEIPT_KEY", "execution": "manual"}, "legacy adapter"),
+    ],
+)
+def test_legacy_bootstrap_rejects_unconfigured_or_verifier_only_manual_execution(board, adapter, match):
+    config = {
+        "operator_targets": ["telegram:operator"],
+        "approval_principals": ["telegram:42"],
+        "legacy_registrations": True,
+        "legacy_adapter_id": "manual",
+        "adapters": [adapter],
+    }
+    with pytest.raises(ValueError, match=match):
+        pi.bootstrap_configured_legacy_incidents(board, config=config, now=0)
+
+
+def test_configured_verifier_only_adapter_dispatch_fails_closed(board):
+    config = {"adapters": [{"id": "verify-only", "secret_env": "P0_RECEIPT_KEY"}]}
+    registry = pi.configured_adapter_registry(config, secret_resolver=lambda _: "receipt-key")
+    incident = _approved_execution(board, adapter_id="verify-only")
+
+    result = pi.controller_tick(board, now=2, registry=registry)
+
+    assert result.blocked == [incident.id]
+    assert pi.get_incident(board, incident.id).state == pi.HUMAN_BLOCKED
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "telegram:masa",
+        "telegram:coaching",
+        "telegram:-1003727537327",
+        "telegram:-1003727537327:435",
+    ],
+)
+def test_masa_and_numeric_telegram_targets_are_rejected_even_when_listed_as_trust_roots(board, target):
+    with pytest.raises(ValueError, match="operator target"):
+        pi.admit_p0_task(
+            board, title="P0", assignee="executor", owner="operator", operator_target=target,
+            gate_spec=spec(), now=0,
+        )
+    config = {
+        "operator_targets": [target],
+        "approval_principals": ["telegram:42"],
+        "legacy_registrations": True,
+        "legacy_adapter_id": "manual",
+        "adapters": [{"id": "manual", "secret_env": "P0_RECEIPT_KEY", "execution": "manual"}],
+    }
+    with pytest.raises(ValueError, match="operator target"):
+        pi.bootstrap_configured_legacy_incidents(board, config=config, now=0)
+
+
+@pytest.mark.parametrize("target", ["telegram:masa", "telegram:-1003727537327:435"])
+def test_gateway_delivery_dead_letters_unsafe_telegram_target_even_when_configured(board, monkeypatch, target):
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as config
+
+    _, incident_id = pi.admit_p0_task(
+        board, title="P0", assignee="executor", owner="operator",
+        operator_target="telegram:operator", gate_spec=spec(), now=0,
+    )
+    board.execute("UPDATE production_notifications SET target=? WHERE incident_id=?", (target, incident_id))
+    operator = OperatorAdapter()
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.adapters = {Platform.TELEGRAM: operator}
+    db_path = board.execute("PRAGMA database_list").fetchone()[2]
+    monkeypatch.setenv("HERMES_KANBAN_DB", db_path)
+    monkeypatch.setattr(config, "load_config", lambda: {"production_incidents": {
+        "operator_targets": [target], "approval_principals": ["ops"],
+    }})
+
+    asyncio.run(runner._production_incident_tick())
+
+    assert not hasattr(operator, "sent")
+    assert board.execute(
+        "SELECT status,last_error FROM production_notifications WHERE incident_id=?", (incident_id,)
+    ).fetchone()[0:2] == ("dead_letter", "unconfigured operator target")
 
 
 def test_unapproved_p0_task_never_enters_normal_dispatch(board):

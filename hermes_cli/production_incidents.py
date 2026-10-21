@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import sqlite3
 from dataclasses import dataclass, replace
@@ -104,6 +105,24 @@ class ConfiguredHmacAdapter:
         return hmac.compare_digest(receipt.attestation, expected)
 
 
+class ConfiguredManualAdapter(ConfiguredHmacAdapter):
+    """Explicitly enabled manual-execution lifecycle with HMAC receipts.
+
+    ``execute`` does not perform the gate action. It only creates a stable
+    execution identity for an operator to attest after completing the approved
+    procedure. Completion remains impossible without a receipt verified by the
+    configured trust root.
+    """
+
+    manual_executor = True
+
+    def execute(self, spec: GateSpec, idempotency_key: str, fence_token: int) -> str:
+        token = hashlib.sha256(
+            f"manual-v1:{idempotency_key}:{fence_token}".encode("utf-8")
+        ).hexdigest()[:24]
+        return f"manual:{fence_token}:{token}"
+
+
 def configured_adapter_registry(config: object, *, secret_resolver: Callable[[str], Optional[str]]) -> AdapterRegistry:
     """Build the runtime verifier registry solely from configured trust roots."""
     if not isinstance(config, dict):
@@ -122,9 +141,14 @@ def configured_adapter_registry(config: object, *, secret_resolver: Callable[[st
         secret = secret_resolver(secret_env)
         if not secret:
             raise ValueError(f"production incident adapter secret is unavailable: {secret_env}")
-        registered[adapter_id] = ConfiguredHmacAdapter(
-            adapter_id, secret, bool(item.get("retry_safe", False)),
-        )
+        execution = str(item.get("execution", "verifier")).strip().lower()
+        if execution == "manual":
+            adapter_type = ConfiguredManualAdapter
+        elif execution == "verifier":
+            adapter_type = ConfiguredHmacAdapter
+        else:
+            raise ValueError("production incident adapter execution must be verifier or manual")
+        registered[adapter_id] = adapter_type(adapter_id, secret, bool(item.get("retry_safe", False)))
     return AdapterRegistry(registered)
 
 
@@ -151,14 +175,50 @@ def spec_digest(spec: GateSpec) -> str:
     return hashlib.sha256(json.dumps(values, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def _target_is_safe(target: str) -> bool:
-    value = target.strip().lower()
-    return bool(value) and "masa" not in value and "coach" not in value and "coaching" not in value
+_OPERATOR_DESTINATION_RE = re.compile(r"^operator(?:[-_][a-z0-9][a-z0-9_-]{0,62})?$")
+_OPERATOR_PLATFORM_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 
-def operator_target_is_safe(target: str) -> bool:
-    """Public structural safety check for gateway delivery-time validation."""
-    return _target_is_safe(target)
+def _parse_operator_target(target: object) -> tuple[str, str] | None:
+    """Parse only named operator trust roots; never chat/topic identifiers."""
+    if not isinstance(target, str) or target != target.strip():
+        return None
+    platform, separator, destination = target.partition(":")
+    if not separator or ":" in destination:
+        return None
+    platform = platform.lower()
+    destination = destination.lower()
+    if not _OPERATOR_PLATFORM_RE.fullmatch(platform):
+        return None
+    # Numeric Telegram chat IDs and ``chat_id:topic_id`` are deliberately not
+    # routing identities for this controller. A named operator trust root is
+    # provisioned separately, which prevents a coaching group/topic from being
+    # selected just by knowing its opaque destination id.
+    if not _OPERATOR_DESTINATION_RE.fullmatch(destination):
+        return None
+    return platform, destination
+
+
+def operator_target_is_safe(target: str, *, trusted_targets: object | None = None) -> bool:
+    """Require a canonical named operator route and, when supplied, its trust root.
+
+    ``trusted_targets`` is the configured route allowlist used by bootstrap,
+    command ingress, and delivery. It is compared canonically and cannot bless
+    opaque numeric or topic-shaped Telegram destinations.
+    """
+    route = _parse_operator_target(target)
+    if route is None:
+        return False
+    if trusted_targets is None:
+        return True
+    if not isinstance(trusted_targets, (list, tuple, set, frozenset)):
+        return False
+    roots = {
+        parsed
+        for item in trusted_targets
+        if (parsed := _parse_operator_target(item)) is not None
+    }
+    return route in roots
 
 
 def install_schema(conn: sqlite3.Connection) -> None:
@@ -255,15 +315,23 @@ def _event(conn: sqlite3.Connection, incident_id: str, kind: str, now: int, **pa
     conn.execute("INSERT INTO production_incident_events (incident_id,kind,payload,created_at) VALUES (?,?,?,?)", (incident_id, kind, json.dumps(payload, sort_keys=True), now))
 
 
-def _outbox(conn: sqlite3.Connection, incident_id: str, target: str, kind: str, now: int) -> None:
-    if not _target_is_safe(target):
-        raise ValueError("operator target must be configured outside coaching/Masa")
-    conn.execute("INSERT OR IGNORE INTO production_notifications (incident_id,target,dedupe_key,body,next_attempt_at,created_at) VALUES (?,?,?,?,?,?)", (incident_id, target, f"{incident_id}:{kind}", f"P0 {incident_id}: {kind}", now, now))
+def _outbox(
+    conn: sqlite3.Connection,
+    incident_id: str,
+    target: str,
+    kind: str,
+    now: int,
+    *,
+    body: str | None = None,
+) -> None:
+    if not operator_target_is_safe(target):
+        raise ValueError("operator target must be a named operator trust root")
+    conn.execute("INSERT OR IGNORE INTO production_notifications (incident_id,target,dedupe_key,body,next_attempt_at,created_at) VALUES (?,?,?,?,?,?)", (incident_id, target, f"{incident_id}:{kind}", body or f"P0 {incident_id}: {kind}", now, now))
 
 
 def admit_p0_task(conn: sqlite3.Connection, *, title: str, assignee: str, owner: str, operator_target: str, gate_spec: GateSpec, now: int, adapter_id: str = "manual", retry_safe: bool = False, task_id: Optional[str] = None, incident_id: Optional[str] = None) -> tuple[str, str]:
-    if not _target_is_safe(operator_target):
-        raise ValueError("operator target must be configured outside coaching/Masa")
+    if not operator_target_is_safe(operator_target):
+        raise ValueError("operator target must be a named operator trust root")
     digest = spec_digest(gate_spec)
     task_id = task_id or "p0_" + secrets.token_hex(8)
     incident_id = incident_id or "pi_" + secrets.token_hex(8)
@@ -491,6 +559,13 @@ def _record_adapter_execution(conn: sqlite3.Connection, incident: Incident, exec
         )
         verified = _cas(conn, incident.id, incident.version, state="verifying", now=now)
         _event(conn, incident.id, "adapter_dispatched", now, execution_id=execution_id, fence=incident.fence_token)
+        target = conn.execute(
+            "SELECT operator_target FROM production_incidents WHERE id=?", (incident.id,),
+        ).fetchone()[0]
+        _outbox(
+            conn, incident.id, target, f"receipt_required:{execution_id}", now,
+            body=f"P0 {incident.id}: receipt required for execution {execution_id}",
+        )
     return verified
 
 
@@ -599,12 +674,12 @@ def fail_notification(conn: sqlite3.Connection, notification_id: int, *, now: in
         return conn.execute("UPDATE production_notifications SET status='pending', lease_until=NULL, next_attempt_at=?, last_error=?, last_error_at=? WHERE id=? AND status='leased'", (now + backoff, error, now, notification_id)).rowcount == 1
 
 
-def register_legacy_incidents(conn: sqlite3.Connection, *, now: int, operator_target: str = "telegram:operator", owner: str = "operator") -> list[str]:
+def register_legacy_incidents(conn: sqlite3.Connection, *, now: int, operator_target: str = "telegram:operator", owner: str = "operator", adapter_id: str = "manual", retry_safe: bool = False) -> list[str]:
     ids = []
-    for issue, adapter, retry in ((335, "manual", False), (328, "manual", False), (336, "manual", False)):
+    for issue in (335, 328, 336):
         existing = conn.execute("SELECT id FROM production_incidents WHERE task_id=?", (f"legacy-{issue}",)).fetchone()
         if existing: ids.append(existing[0]); continue
-        _, incident = admit_p0_task(conn, title=f"fitness-system#{issue}", assignee="executor", owner=owner, operator_target=operator_target, gate_spec=GateSpec("execute approved production gate", "production impact", "follow documented rollback", "capture verifier receipt", f"fitness-system#{issue}", "production"), now=now, adapter_id=adapter, retry_safe=retry, task_id=f"legacy-{issue}")
+        _, incident = admit_p0_task(conn, title=f"fitness-system#{issue}", assignee="executor", owner=owner, operator_target=operator_target, gate_spec=GateSpec("execute approved production gate", "production impact", "follow documented rollback", "capture verifier receipt", f"fitness-system#{issue}", "production"), now=now, adapter_id=adapter_id, retry_safe=retry_safe, task_id=f"legacy-{issue}")
         ids.append(incident)
     return ids
 
@@ -619,12 +694,25 @@ def bootstrap_configured_legacy_incidents(conn: sqlite3.Connection, *, config: o
         return []
     targets = config.get("operator_targets")
     principals = config.get("approval_principals")
-    if not isinstance(targets, list) or len(targets) != 1 or not isinstance(principals, list) or not principals:
+    adapters = config.get("adapters")
+    adapter_id = str(config.get("legacy_adapter_id", "")).strip()
+    if not isinstance(targets, list) or len(targets) != 1 or not isinstance(principals, list) or not principals or not isinstance(adapters, list) or not adapter_id:
         raise ValueError("production incident configured legacy bootstrap requires exactly one operator target and approval trust roots")
     target = str(targets[0]).strip()
-    if not _target_is_safe(target):
-        raise ValueError("operator target must be configured outside coaching/Masa")
+    if not operator_target_is_safe(target, trusted_targets=targets):
+        raise ValueError("operator target must be a named operator trust root")
+    adapter_config = next(
+        (item for item in adapters if isinstance(item, dict) and str(item.get("id", "")).strip() == adapter_id),
+        None,
+    )
+    if adapter_config is None:
+        raise ValueError("production incident configured legacy bootstrap requires a configured legacy adapter")
+    if str(adapter_config.get("execution", "verifier")).strip().lower() != "manual":
+        raise ValueError("production incident configured legacy bootstrap requires a manual executor")
     owner = str(config.get("legacy_owner", "operator")).strip()
     if not owner:
         raise ValueError("production incident legacy owner is required")
-    return register_legacy_incidents(conn, now=now, operator_target=target, owner=owner)
+    return register_legacy_incidents(
+        conn, now=now, operator_target=target, owner=owner, adapter_id=adapter_id,
+        retry_safe=bool(adapter_config.get("retry_safe", False)),
+    )

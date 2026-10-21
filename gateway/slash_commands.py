@@ -600,7 +600,7 @@ class GatewaySlashCommandsMixin:
         if (
             not isinstance(targets, list)
             or route not in {str(item).strip() for item in targets}
-            or not _pi.operator_target_is_safe(route)
+            or not _pi.operator_target_is_safe(route, trusted_targets=targets)
         ):
             return "Production approval denied: configured operator route required."
         try:
