@@ -202,6 +202,7 @@ class GatewayKanbanWatchersMixin:
             if not targets or not principals:
                 logger.error("production incident controller: missing configured trust roots; refusing P0 delivery")
                 return
+            routes = _pi.configured_operator_routes(cfg)
             now = int(time.time())
             estop = not _kanban_dispatch_allowed()
             boards = _kb.list_boards(include_archived=False)
@@ -220,7 +221,8 @@ class GatewayKanbanWatchersMixin:
                 note = await asyncio.to_thread(_control)
                 if not note:
                     continue
-                if not _pi.operator_target_is_safe(note.target, trusted_targets=targets):
+                route = routes.get(note.target)
+                if route is None:
                     def _dead_letter():
                         conn = _kb.connect(board=slug)
                         try: _pi.fail_notification(conn, note.id, now=now, error="unconfigured operator target", max_attempts=1)
@@ -228,11 +230,13 @@ class GatewayKanbanWatchersMixin:
                     await asyncio.to_thread(_dead_letter)
                     continue
                 try:
-                    platform_name, chat_id = note.target.split(":", 1)
-                    adapter = self.adapters.get(_Platform(platform_name.lower()))
+                    adapter = self.adapters.get(_Platform(route.platform))
                     if adapter is None:
                         raise RuntimeError("configured operator adapter unavailable")
-                    sent = await adapter.send(chat_id, note.body, metadata={"production_incident": note.incident_id})
+                    metadata = {"production_incident": note.incident_id}
+                    if route.thread_id is not None:
+                        metadata["thread_id"] = route.thread_id
+                    sent = await adapter.send(route.chat_id, note.body, metadata=metadata)
                     if getattr(sent, "success", True) is False:
                         raise RuntimeError("configured operator adapter rejected delivery")
                 except Exception as exc:

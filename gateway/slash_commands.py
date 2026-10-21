@@ -593,15 +593,15 @@ class GatewaySlashCommandsMixin:
         principal = f"{platform.lower()}:{user_id}"
         cfg = load_config().get("production_incidents", {})
         allowed = cfg.get("approval_principals", []) if isinstance(cfg, dict) else []
-        targets = cfg.get("operator_targets", []) if isinstance(cfg, dict) else []
-        route = f"{platform.lower()}:{str(getattr(source, 'chat_id', '') or '').strip()}"
         if not isinstance(allowed, list) or principal not in {str(item).strip() for item in allowed}:
             return "Production approval denied: principal is not configured."
-        if (
-            not isinstance(targets, list)
-            or route not in {str(item).strip() for item in targets}
-            or not _pi.operator_target_is_safe(route, trusted_targets=targets)
-        ):
+        route = _pi.configured_operator_route_for_source(
+            cfg,
+            platform=platform,
+            chat_id=getattr(source, "chat_id", ""),
+            thread_id=getattr(source, "thread_id", None),
+        )
+        if route is None:
             return "Production approval denied: configured operator route required."
         try:
             incident_id, version_text, expiry_text = shlex.split(event.get_command_args())
@@ -613,10 +613,19 @@ class GatewaySlashCommandsMixin:
         def _approve() -> None:
             conn = _kb.connect()
             try:
-                _pi.grant_approval(
+                bound_target = conn.execute(
+                    "SELECT operator_target FROM production_incidents WHERE id=?", (incident_id,),
+                ).fetchone()
+                if not bound_target or bound_target[0] != route.target:
+                    raise _pi.StateConflict("incident is bound to a different operator route")
+                approved = _pi.grant_approval(
                     conn, incident_id, principal=principal,
                     expected_version=expected_version, expires_at=expires_at,
                     now=int(time.time()), allowed_principals={principal},
+                )
+                _pi.begin_approved_execution(
+                    conn, incident_id, expected_version=approved.version,
+                    now=int(time.time()),
                 )
             finally:
                 conn.close()
@@ -629,6 +638,66 @@ class GatewaySlashCommandsMixin:
             logger.exception("production approval route failed")
             return "Production approval unavailable; operator outbox will retain the gate."
         return "Production approval recorded."
+
+    async def _handle_production_receipt_command(self, event: MessageEvent) -> str:
+        """Accept one signed manual-executor receipt from its configured route.
+
+        Both gateway authentication and the physical chat/topic mapping are
+        required before the HMAC verifier is consulted.  The receipt itself is
+        still bound to the active incident fence and evidence deadline by the
+        database controller.
+        """
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli import production_incidents as _pi
+        from hermes_cli.config import get_env_value, load_config
+
+        source = getattr(event, "source", None)
+        platform = getattr(getattr(source, "platform", None), "value", "")
+        user_id = str(getattr(source, "user_id", "") or "").strip()
+        if getattr(event, "internal", False) or not platform or not user_id or not self._is_user_authorized(source):
+            return "Production receipt denied: authenticated operator identity required."
+        principal = f"{platform.lower()}:{user_id}"
+        cfg = load_config().get("production_incidents", {})
+        allowed = cfg.get("receipt_principals", []) if isinstance(cfg, dict) else []
+        if not isinstance(allowed, list) or principal not in {str(item).strip() for item in allowed}:
+            return "Production receipt denied: principal is not configured."
+        route = _pi.configured_operator_route_for_source(
+            cfg,
+            platform=platform,
+            chat_id=getattr(source, "chat_id", ""),
+            thread_id=getattr(source, "thread_id", None),
+        )
+        if route is None:
+            return "Production receipt denied: configured operator route required."
+        try:
+            incident_id, adapter_id, execution_id, fence_text, digest, attestation = shlex.split(event.get_command_args())
+            receipt = _pi.Receipt(
+                incident_id, adapter_id, execution_id, int(fence_text), digest, attestation,
+            )
+            registry = _pi.configured_adapter_registry(cfg, secret_resolver=get_env_value)
+        except (TypeError, ValueError):
+            return "Usage: /production-receipt <incident-id> <adapter-id> <execution-id> <fence-token> <spec-digest> <attestation>"
+
+        def _accept() -> None:
+            conn = _kb.connect()
+            try:
+                bound_target = conn.execute(
+                    "SELECT operator_target FROM production_incidents WHERE id=?", (receipt.incident_id,),
+                ).fetchone()
+                if not bound_target or bound_target[0] != route.target:
+                    raise _pi.StateConflict("incident is bound to a different operator route")
+                _pi.accept_adapter_receipt(conn, receipt, registry=registry, now=int(time.time()))
+            finally:
+                conn.close()
+
+        try:
+            await asyncio.to_thread(_accept)
+        except (_pi.StateConflict, ValueError):
+            return "Production receipt denied: stale, expired, or invalid incident state."
+        except Exception:
+            logger.exception("production receipt route failed")
+            return "Production receipt unavailable; operator outbox will retain the gate."
+        return "Production receipt recorded."
 
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""

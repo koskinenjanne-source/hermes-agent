@@ -15677,6 +15677,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "restart": self._handle_restart_command,
                 "approve": self._handle_approve_command,
                 "production-approve": self._handle_production_approve_command,
+                "production-receipt": self._handle_production_receipt_command,
                 "deny": self._handle_deny_command,
                 "pause": self._handle_pause_command,
                 "agents": self._handle_agents_command,
@@ -16951,6 +16952,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "production-approve":
             return await self._handle_production_approve_command(event)
+
+        if canonical == "production-receipt":
+            return await self._handle_production_receipt_command(event)
 
         if canonical == "suggestions":
             return await self._handle_suggestions_command(event)

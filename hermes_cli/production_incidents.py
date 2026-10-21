@@ -58,6 +58,15 @@ class Notification:
 
 
 @dataclass(frozen=True)
+class OperatorRoute:
+    """A named trust root bound to one physical platform destination."""
+    target: str
+    platform: str
+    chat_id: str
+    thread_id: str | None = None
+
+
+@dataclass(frozen=True)
 class Receipt:
     incident_id: str
     adapter_id: str
@@ -219,6 +228,93 @@ def operator_target_is_safe(target: str, *, trusted_targets: object | None = Non
         if (parsed := _parse_operator_target(item)) is not None
     }
     return route in roots
+
+
+def configured_operator_routes(config: object) -> dict[str, OperatorRoute]:
+    """Resolve named operator roots to physical routes from operator config only.
+
+    Incident rows and task metadata retain the symbolic trust-root name.  The
+    numeric chat/topic values appear only in this operator-owned mapping, so a
+    task cannot redirect P0 ingress or egress by supplying an opaque Telegram
+    destination.
+    """
+    if not isinstance(config, dict):
+        raise ValueError("production incident configuration must be a mapping")
+    targets = config.get("operator_targets", [])
+    raw_routes = config.get("operator_routes", {})
+    if not isinstance(targets, list) or not isinstance(raw_routes, dict):
+        raise ValueError("production incident operator targets and routes must be configured")
+    parsed_targets: dict[str, tuple[str, str]] = {}
+    for target in targets:
+        parsed = _parse_operator_target(target)
+        if parsed is None:
+            raise ValueError("operator target must be a named operator trust root")
+        canonical = f"{parsed[0]}:{parsed[1]}"
+        if canonical in parsed_targets:
+            raise ValueError("production incident operator targets must be unique")
+        parsed_targets[canonical] = parsed
+    if set(raw_routes) != set(parsed_targets):
+        raise ValueError("production incident operator routes must map every named trust root exactly once")
+    routes: dict[str, OperatorRoute] = {}
+    for target, (platform, _destination) in parsed_targets.items():
+        route = raw_routes[target]
+        if not isinstance(route, dict):
+            raise ValueError("production incident operator route must be a mapping")
+        chat_id = str(route.get("chat_id", "")).strip()
+        raw_thread_id = route.get("thread_id")
+        thread_id = str(raw_thread_id).strip() if raw_thread_id is not None else None
+        if not chat_id or (raw_thread_id is not None and not thread_id):
+            raise ValueError("production incident operator route requires a chat_id and optional non-empty thread_id")
+        # Telegram's physical address is numeric.  Rejecting symbolic and
+        # compound values here prevents a named route from smuggling a second
+        # target or delegating resolution to the adapter.
+        if platform == "telegram":
+            if not re.fullmatch(r"-?\d+", chat_id) or (thread_id is not None and not re.fullmatch(r"\d+", thread_id)):
+                raise ValueError("Telegram operator route requires numeric chat_id and thread_id")
+        routes[target] = OperatorRoute(target, platform, chat_id, thread_id)
+    return routes
+
+
+def resolve_operator_route(target: str, *, config: object) -> OperatorRoute | None:
+    """Return the configured physical route for one named trust root only."""
+    try:
+        return configured_operator_routes(config).get(target)
+    except ValueError:
+        return None
+
+
+def operator_route_matches_source(
+    route: OperatorRoute,
+    *,
+    platform: object,
+    chat_id: object,
+    thread_id: object = None,
+) -> bool:
+    """Require ingress to match the configured physical route exactly."""
+    return (
+        str(platform).strip().lower() == route.platform
+        and str(chat_id).strip() == route.chat_id
+        and (str(thread_id).strip() if thread_id is not None else None) == route.thread_id
+    )
+
+
+def configured_operator_route_for_source(
+    config: object,
+    *,
+    platform: object,
+    chat_id: object,
+    thread_id: object = None,
+) -> OperatorRoute | None:
+    """Find the sole configured trust root bound to an authenticated source."""
+    try:
+        routes = configured_operator_routes(config).values()
+    except ValueError:
+        return None
+    matches = [
+        route for route in routes
+        if operator_route_matches_source(route, platform=platform, chat_id=chat_id, thread_id=thread_id)
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def install_schema(conn: sqlite3.Connection) -> None:
@@ -439,11 +535,29 @@ def accept_adapter_receipt(conn: sqlite3.Connection, receipt: Receipt, *, regist
             raise StateConflict("stale or foreign receipt")
         if incident.state not in {"approved_executing", "verifying"}:
             raise StateConflict("receipt requires approved execution")
+        if incident.evidence_deadline <= now:
+            raise StateConflict("evidence deadline elapsed")
         execution = conn.execute("SELECT 1 FROM production_executions WHERE incident_id=? AND execution_id=? AND fence_token=? AND spec_digest=? AND adapter_id=?", (receipt.incident_id, receipt.execution_id, receipt.fence_token, receipt.spec_digest, receipt.adapter_id)).fetchone()
         if not execution:
             raise StateConflict("receipt is not bound to an approved adapter execution")
         conn.execute("INSERT INTO production_evidence (incident_id,adapter_id,execution_id,fence_token,spec_digest,attestation,accepted_at) VALUES (?,?,?,?,?,?,?)", (receipt.incident_id, receipt.adapter_id, receipt.execution_id, receipt.fence_token, receipt.spec_digest, receipt.attestation, now))
-        incident = _cas(conn, receipt.incident_id, incident.version, state=COMPLETED, now=now, evidence_deadline=now + EVIDENCE_WINDOW_SECONDS)
+        # Make the deadline check part of the completion write itself.  A
+        # verifier may finish just as the watchdog fences the incident; the
+        # stale receipt must then roll back its evidence insert rather than win
+        # based on an earlier read of the deadline.
+        completed = conn.execute(
+            "UPDATE production_incidents SET state=?,version=version+1,updated_at=?,evidence_deadline=? "
+            "WHERE id=? AND version=? AND state IN ('approved_executing','verifying') "
+            "AND adapter_id=? AND fence_token=? AND spec_digest=? AND evidence_deadline>?",
+            (
+                COMPLETED, now, now + EVIDENCE_WINDOW_SECONDS, receipt.incident_id,
+                incident.version, receipt.adapter_id, receipt.fence_token,
+                receipt.spec_digest, now,
+            ),
+        )
+        if completed.rowcount != 1:
+            raise StateConflict("evidence deadline elapsed or incident state changed")
+        incident = get_incident(conn, receipt.incident_id)
         _event(conn, receipt.incident_id, "evidence_accepted", now, execution_id=receipt.execution_id, receipt_digest=hashlib.sha256(receipt.attestation.encode()).hexdigest())
     return incident
 
@@ -699,7 +813,8 @@ def bootstrap_configured_legacy_incidents(conn: sqlite3.Connection, *, config: o
     if not isinstance(targets, list) or len(targets) != 1 or not isinstance(principals, list) or not principals or not isinstance(adapters, list) or not adapter_id:
         raise ValueError("production incident configured legacy bootstrap requires exactly one operator target and approval trust roots")
     target = str(targets[0]).strip()
-    if not operator_target_is_safe(target, trusted_targets=targets):
+    routes = configured_operator_routes(config)
+    if target not in routes:
         raise ValueError("operator target must be a named operator trust root")
     adapter_config = next(
         (item for item in adapters if isinstance(item, dict) and str(item.get("id", "")).strip() == adapter_id),

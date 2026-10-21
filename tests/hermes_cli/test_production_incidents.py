@@ -5,6 +5,7 @@ import hmac
 import sqlite3
 import asyncio
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -180,9 +181,14 @@ def test_gateway_controller_acknowledges_only_configured_operator_outbox(board, 
     runner._production_adapter_registry = pi.AdapterRegistry()
     db_path = board.execute("PRAGMA database_list").fetchone()[2]
     monkeypatch.setenv("HERMES_KANBAN_DB", db_path)
-    monkeypatch.setattr(config, "load_config", lambda: {"production_incidents": {"operator_targets": ["telegram:operator"], "approval_principals": ["ops"]}})
+    monkeypatch.setattr(config, "load_config", lambda: {"production_incidents": {
+        "operator_targets": ["telegram:operator"],
+        "operator_routes": {"telegram:operator": {"chat_id": "-100999000111", "thread_id": "77"}},
+        "approval_principals": ["ops"],
+    }})
     asyncio.run(runner._production_incident_tick())
-    assert operator.sent[0] == "operator"
+    assert operator.sent[0] == "-100999000111"
+    assert operator.sent[2]["thread_id"] == "77"
     assert board.execute("SELECT status FROM production_notifications WHERE incident_id=?", (incident_id,)).fetchone()[0] == "acknowledged"
 
 
@@ -197,7 +203,9 @@ def test_gateway_bootstraps_configured_legacy_incidents_and_registry(board, monk
     monkeypatch.setenv("HERMES_KANBAN_DB", db_path)
     monkeypatch.setenv("P0_RECEIPT_KEY", "receipt-key")
     monkeypatch.setattr(config, "load_config", lambda: {"production_incidents": {
-        "operator_targets": ["telegram:operator"], "approval_principals": ["telegram:42"],
+        "operator_targets": ["telegram:operator"],
+        "operator_routes": {"telegram:operator": {"chat_id": "-100999000111", "thread_id": "77"}},
+        "approval_principals": ["telegram:42"],
         "legacy_registrations": True,
         "legacy_adapter_id": "ops-hmac",
         "adapters": [{"id": "ops-hmac", "secret_env": "P0_RECEIPT_KEY", "execution": "manual"}],
@@ -221,11 +229,13 @@ def test_gateway_approval_command_uses_authenticated_configured_principal(board,
     db_path = board.execute("PRAGMA database_list").fetchone()[2]
     monkeypatch.setenv("HERMES_KANBAN_DB", db_path)
     monkeypatch.setattr(config, "load_config", lambda: {"production_incidents": {
-        "operator_targets": ["telegram:operator"], "approval_principals": ["telegram:42"],
+        "operator_targets": ["telegram:operator"],
+        "operator_routes": {"telegram:operator": {"chat_id": "-100999000111", "thread_id": "77"}},
+        "approval_principals": ["telegram:42"],
     }})
-    event = MessageEvent(text=f"/production-approve {incident_id} 2 4000000000", source=SessionSource(platform=Platform.TELEGRAM, chat_id="operator", chat_type="dm", user_id="42"))
+    event = MessageEvent(text=f"/production-approve {incident_id} 2 4000000000", source=SessionSource(platform=Platform.TELEGRAM, chat_id="-100999000111", thread_id="77", chat_type="group", user_id="42"))
     assert asyncio.run(runner._handle_production_approve_command(event)) == "Production approval recorded."
-    assert pi.get_incident(board, incident_id).state == "approved_dispatching"
+    assert pi.get_incident(board, incident_id).state == "approved_executing"
 
 
 def test_p0_admission_is_bound_and_completion_requires_verified_evidence(board):
@@ -299,6 +309,7 @@ def test_legacy_registration_is_idempotent(board):
 def test_configured_legacy_bootstrap_and_hmac_adapter_are_fail_closed(board):
     config = {
         "operator_targets": ["telegram:operator"],
+        "operator_routes": {"telegram:operator": {"chat_id": "-100999000111", "thread_id": "77"}},
         "approval_principals": ["telegram:42"],
         "legacy_registrations": True,
         "legacy_adapter_id": "ops-hmac",
@@ -318,6 +329,7 @@ def test_configured_legacy_bootstrap_and_hmac_adapter_are_fail_closed(board):
 def test_configured_legacy_manual_executor_completes_only_after_a_verified_receipt(board):
     config = {
         "operator_targets": ["telegram:operator"],
+        "operator_routes": {"telegram:operator": {"chat_id": "-100999000111", "thread_id": "77"}},
         "approval_principals": ["telegram:42"],
         "legacy_registrations": True,
         "legacy_adapter_id": "manual-receipt",
@@ -373,6 +385,7 @@ def test_configured_legacy_manual_executor_completes_only_after_a_verified_recei
 def test_legacy_bootstrap_rejects_unconfigured_or_verifier_only_manual_execution(board, adapter, match):
     config = {
         "operator_targets": ["telegram:operator"],
+        "operator_routes": {"telegram:operator": {"chat_id": "-100999000111", "thread_id": "77"}},
         "approval_principals": ["telegram:42"],
         "legacy_registrations": True,
         "legacy_adapter_id": "manual",
@@ -410,6 +423,7 @@ def test_masa_and_numeric_telegram_targets_are_rejected_even_when_listed_as_trus
         )
     config = {
         "operator_targets": [target],
+        "operator_routes": {target: {"chat_id": "-100999000111", "thread_id": "77"}},
         "approval_principals": ["telegram:42"],
         "legacy_registrations": True,
         "legacy_adapter_id": "manual",
@@ -436,7 +450,9 @@ def test_gateway_delivery_dead_letters_unsafe_telegram_target_even_when_configur
     db_path = board.execute("PRAGMA database_list").fetchone()[2]
     monkeypatch.setenv("HERMES_KANBAN_DB", db_path)
     monkeypatch.setattr(config, "load_config", lambda: {"production_incidents": {
-        "operator_targets": [target], "approval_principals": ["ops"],
+        "operator_targets": ["telegram:operator"],
+        "operator_routes": {"telegram:operator": {"chat_id": "-100999000111", "thread_id": "77"}},
+        "approval_principals": ["ops"],
     }})
 
     asyncio.run(runner._production_incident_tick())
@@ -477,6 +493,147 @@ def test_receipt_requires_live_approved_execution(board):
     )
     with pytest.raises(ValueError, match="raw attestations"):
         pi.accept_verified_receipt(board, incident_id=incident_id, adapter_id="manual", execution_id="forged", fence_token=1, spec_digest=pi.spec_digest(spec()), attestation="verified:forged", now=1)
+
+
+def test_named_operator_route_resolves_to_physical_topic_and_rejects_opaque_targets():
+    config = {
+        "operator_targets": ["telegram:operator"],
+        "operator_routes": {
+            "telegram:operator": {
+                "chat_id": "-100999000111",
+                "thread_id": "77",
+            },
+        },
+    }
+
+    route = pi.resolve_operator_route("telegram:operator", config=config)
+
+    assert route is not None
+    assert route.target == "telegram:operator"
+    assert route.chat_id == "-100999000111"
+    assert route.thread_id == "77"
+    assert pi.resolve_operator_route("telegram:-100999000111:77", config=config) is None
+    assert pi.operator_route_matches_source(
+        route, platform="telegram", chat_id="-100999000111", thread_id="77",
+    )
+    assert not pi.operator_route_matches_source(
+        route, platform="telegram", chat_id="-100999000111", thread_id="78",
+    )
+
+
+def test_gateway_manual_receipt_ingress_is_authenticated_and_bound_to_configured_route(board, monkeypatch):
+    from gateway.config import Platform
+    from gateway.platforms.base import MessageEvent
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+    import hermes_cli.config as config
+
+    cfg = {
+        "operator_targets": ["telegram:operator", "telegram:operator-backup"],
+        "operator_routes": {
+            "telegram:operator": {
+                "chat_id": "-100999000111",
+                "thread_id": "77",
+            },
+            "telegram:operator-backup": {
+                "chat_id": "-100999000222",
+                "thread_id": "78",
+            },
+        },
+        "approval_principals": ["telegram:42"],
+        "receipt_principals": ["telegram:42"],
+        "adapters": [{
+            "id": "manual-receipt",
+            "secret_env": "P0_RECEIPT_KEY",
+            "execution": "manual",
+        }],
+    }
+    runner = GatewayRunner.__new__(GatewayRunner)
+    operator = OperatorAdapter()
+    runner.adapters = {Platform.TELEGRAM: operator}
+    runner._is_user_authorized = lambda source: True
+    db_path = board.execute("PRAGMA database_list").fetchone()[2]
+    monkeypatch.setenv("HERMES_KANBAN_DB", db_path)
+    monkeypatch.setenv("P0_RECEIPT_KEY", "receipt-key")
+    monkeypatch.setattr(config, "load_config", lambda: {"production_incidents": cfg})
+
+    now = int(time.time())
+    _, incident_id = pi.admit_p0_task(
+        board, title="P0", assignee="executor", owner="operator",
+        operator_target="telegram:operator", gate_spec=spec(), now=now,
+        adapter_id="manual-receipt",
+    )
+    pi.require_approval(board, incident_id, expected_version=1, now=now + 1)
+    source = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="-100999000111", thread_id="77",
+        chat_type="group", user_id="42",
+    )
+    approval = MessageEvent(
+        text=f"/production-approve {incident_id} 2 4000000000", source=source,
+    )
+    assert asyncio.run(runner._handle_production_approve_command(approval)) == "Production approval recorded."
+    asyncio.run(runner._production_incident_tick())
+    verifying = pi.get_incident(board, incident_id)
+    execution_id = board.execute(
+        "SELECT execution_id FROM production_executions WHERE incident_id=?", (incident_id,),
+    ).fetchone()[0]
+    unsigned = pi.Receipt(
+        incident_id, "manual-receipt", execution_id, verifying.fence_token,
+        verifying.spec_digest, "",
+    )
+    receipt = unsigned.__class__(**{
+        **unsigned.__dict__,
+        "attestation": hmac.new(
+            b"receipt-key", pi.receipt_payload(unsigned).encode(), hashlib.sha256,
+        ).hexdigest(),
+    })
+    args = " ".join((
+        receipt.incident_id, receipt.adapter_id, receipt.execution_id,
+        str(receipt.fence_token), receipt.spec_digest, receipt.attestation,
+    ))
+    wrong_topic = MessageEvent(
+        text=f"/production-receipt {args}",
+        source=SessionSource(
+            platform=Platform.TELEGRAM, chat_id="-100999000222", thread_id="78",
+            chat_type="group", user_id="42",
+        ),
+    )
+    assert "Production receipt denied" in asyncio.run(
+        runner._handle_production_receipt_command(wrong_topic),
+    )
+    assert pi.get_incident(board, incident_id).state == "verifying"
+
+    accepted = MessageEvent(text=f"/production-receipt {args}", source=source)
+    assert asyncio.run(runner._handle_production_receipt_command(accepted)) == "Production receipt recorded."
+    assert pi.get_incident(board, incident_id).state == pi.COMPLETED
+    assert operator.sent[0] == "-100999000111"
+    assert operator.sent[2]["thread_id"] == "77"
+
+
+def test_late_valid_receipt_is_rejected_without_evidence_or_completion(board):
+    incident = _approved_execution(board)
+    adapter = SignedAdapter()
+    registry = pi.AdapterRegistry({adapter.adapter_id: adapter})
+    pi.controller_tick(board, now=2, registry=registry)
+    verifying = pi.get_incident(board, incident.id)
+    unsigned = pi.Receipt(
+        verifying.id, "signed", "execution-1", verifying.fence_token,
+        verifying.spec_digest, "",
+    )
+    receipt = unsigned.__class__(**{
+        **unsigned.__dict__,
+        "attestation": hmac.new(adapter.key, pi.receipt_payload(unsigned).encode(), hashlib.sha256).hexdigest(),
+    })
+
+    with pytest.raises(pi.StateConflict, match="evidence deadline"):
+        pi.accept_adapter_receipt(
+            board, receipt, registry=registry, now=verifying.evidence_deadline,
+        )
+
+    assert pi.get_incident(board, incident.id).state == "verifying"
+    assert board.execute(
+        "SELECT COUNT(*) FROM production_evidence WHERE incident_id=?", (incident.id,),
+    ).fetchone()[0] == 0
 
 
 def test_retry_safe_timeout_reclaims_normal_task_run_before_fencing(board):
